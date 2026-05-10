@@ -1,0 +1,9 @@
+services:
+  telegram-notion-daily-assistant:
+    build: .
+    container_name: telegram-notion-daily-assistant
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
