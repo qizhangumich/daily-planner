@@ -4,7 +4,7 @@ import logging
 import tempfile
 from pathlib import Path
 
-from telegram import Update
+from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -24,22 +24,35 @@ from app.storage import Storage
 
 logger = logging.getLogger(__name__)
 
+TAB_RECORD = "记录"
+TAB_REVIEW = "回顾"
+TAB_REFLECTION = "反思"
 
-HELP_TEXT = """欢迎使用 telegram-notion-daily-assistant。
+HELP_TEXT = """欢迎使用每日记录助手。
 
-可用指令：
+底部有 3 个常用入口：
+- 记录：记录今天早上的安排、任务或计划
+- 回顾：记录当天的完成情况
+- 反思：记录今天的感受、收获和改进点
+
+也可以继续使用这些命令：
 /start - 显示欢迎信息
-/add - 添加今日任务
+/add - 添加今天的任务记录
 /today - 查看今天已记录的任务
-/review - 手动触发今天的复盘流程
-/reflection - 手动添加今天的反思
+/review - 手动开始当天回顾
+/reflection - 手动开始今天反思
 /help - 显示帮助信息
 
 你也可以直接发送文字或语音：
-- 默认会记录为今日任务
-- 晚间复盘提醒后，会自动理解为复盘内容
-- 复盘完成后，会自动理解为今日反思
-"""
+- 默认会作为“记录”内容处理
+- 进入“回顾”后，会把输入理解为当天完成情况
+- 进入“反思”后，会把输入理解为今天的收获与思考"""
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(TAB_RECORD), KeyboardButton(TAB_REVIEW), KeyboardButton(TAB_REFLECTION)]],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
 
 class TelegramDailyAssistantBot:
@@ -82,18 +95,21 @@ class TelegramDailyAssistantBot:
         if not await self._is_authorized(update):
             return
         self.state_manager.set_state(self.settings.telegram_user_id, "idle")
-        await update.message.reply_text(HELP_TEXT)
+        await update.message.reply_text(HELP_TEXT, reply_markup=MAIN_KEYBOARD)
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
             return
-        await update.message.reply_text(HELP_TEXT)
+        await update.message.reply_text(HELP_TEXT, reply_markup=MAIN_KEYBOARD)
 
     async def add_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
             return
         self.state_manager.set_state(self.settings.telegram_user_id, "adding_task")
-        await update.message.reply_text("请把今天想添加的任务发给我。可以是文字，也可以是一段语音。")
+        await update.message.reply_text(
+            "把今天早上要记录的内容发给我吧。可以是文字，也可以是一段语音。",
+            reply_markup=MAIN_KEYBOARD,
+        )
 
     async def today_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
@@ -101,18 +117,24 @@ class TelegramDailyAssistantBot:
         try:
             tasks = await self.daily_record_service.get_today_tasks()
         except DailyRecordServiceError as exc:
-            await update.message.reply_text(f"读取今天任务失败：{exc}")
+            await update.message.reply_text(f"读取今天任务失败：{exc}", reply_markup=MAIN_KEYBOARD)
             return
 
         if not tasks:
-            await update.message.reply_text("今天还没有记录任务。你可以直接发文字或语音给我。")
+            await update.message.reply_text(
+                "今天还没有记录内容。你可以点“记录”，或者直接发文字/语音给我。",
+                reply_markup=MAIN_KEYBOARD,
+            )
             return
 
         lines = [
             f"{index}. {task['title']} [{task['priority']}] ({task['status']})"
             for index, task in enumerate(tasks, start=1)
         ]
-        await update.message.reply_text("今天已经记录的任务：\n\n" + "\n".join(lines))
+        await update.message.reply_text(
+            "今天已经记录的任务：\n\n" + "\n".join(lines),
+            reply_markup=MAIN_KEYBOARD,
+        )
 
     async def review_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
@@ -123,15 +145,31 @@ class TelegramDailyAssistantBot:
         if not await self._is_authorized(update):
             return
         self.state_manager.set_state(self.settings.telegram_user_id, "awaiting_reflection")
-        await update.message.reply_text("请直接回复今天的感受、反思或收获。可以是一句话，也可以是一段语音。")
+        await update.message.reply_text(
+            "请直接回复今天的感受、反思或收获。可以是一句话，也可以是一段语音。",
+            reply_markup=MAIN_KEYBOARD,
+        )
 
     async def text_message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
             return
         text = (update.message.text or "").strip()
         if not text:
-            await update.message.reply_text("我没有收到有效文字内容，请再发一次。")
+            await update.message.reply_text("我没有收到有效文字内容，请再发一次。", reply_markup=MAIN_KEYBOARD)
             return
+
+        if text == TAB_RECORD:
+            await self.add_command(update, context)
+            return
+
+        if text == TAB_REVIEW:
+            await self.review_command(update, context)
+            return
+
+        if text == TAB_REFLECTION:
+            await self.reflection_command(update, context)
+            return
+
         await self._route_user_input(update, text, source="Telegram Text")
 
     async def voice_message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -141,14 +179,17 @@ class TelegramDailyAssistantBot:
         try:
             transcript = await self.transcribe_telegram_voice(update, context)
         except DailyRecordServiceError as exc:
-            await update.message.reply_text(f"语音转写失败：{exc}")
+            await update.message.reply_text(f"语音转写失败：{exc}", reply_markup=MAIN_KEYBOARD)
             return
 
         if not transcript:
-            await update.message.reply_text("语音已经收到，但没有成功识别出文字内容，请再试一次。")
+            await update.message.reply_text(
+                "语音已经收到，但没有成功识别出文字内容，请再试一次。",
+                reply_markup=MAIN_KEYBOARD,
+            )
             return
 
-        await update.message.reply_text(f"语音已转写：\n{transcript}")
+        await update.message.reply_text(f"语音已转写：\n{transcript}", reply_markup=MAIN_KEYBOARD)
         await self._route_user_input(update, transcript, source="Telegram Voice")
 
     async def transcribe_telegram_voice(
@@ -186,7 +227,11 @@ class TelegramDailyAssistantBot:
         try:
             payload = await self.daily_record_service.prepare_evening_review()
         except DailyRecordServiceError as exc:
-            await self.application.bot.send_message(chat_id=chat_id, text=f"今晚复盘提醒发送失败：{exc}")
+            await self.application.bot.send_message(
+                chat_id=chat_id,
+                text=f"今晚回顾提醒发送失败：{exc}",
+                reply_markup=MAIN_KEYBOARD,
+            )
             return
 
         tasks = payload.get("tasks", [])
@@ -194,7 +239,7 @@ class TelegramDailyAssistantBot:
             lines = [f"{index}. {task['title']}" for index, task in enumerate(tasks, start=1)]
             task_text = "\n".join(lines)
             message = (
-                "今天的任务复盘时间到了。\n\n"
+                "今天的回顾时间到了。\n\n"
                 "你今天记录了以下任务：\n\n"
                 f"{task_text}\n\n"
                 "请直接回复这些任务的完成情况。\n"
@@ -202,13 +247,13 @@ class TelegramDailyAssistantBot:
             )
         else:
             message = (
-                "今天的任务复盘时间到了。\n\n"
-                "今天还没有记录任务，你也可以直接做一次自由复盘。\n"
+                "今天的回顾时间到了。\n\n"
+                "今天还没有记录任务，你也可以直接做一次自由回顾。\n"
                 "请告诉我今天完成了什么、没完成什么，以及原因。"
             )
 
         self.state_manager.set_state(self.settings.telegram_user_id, "awaiting_review")
-        await self.application.bot.send_message(chat_id=chat_id, text=message)
+        await self.application.bot.send_message(chat_id=chat_id, text=message, reply_markup=MAIN_KEYBOARD)
 
     async def _route_user_input(self, update: Update, user_input: str, source: str) -> None:
         state = self.state_manager.get_state(self.settings.telegram_user_id)
@@ -240,32 +285,32 @@ class TelegramDailyAssistantBot:
         try:
             result = await self.daily_record_service.add_task_to_today(user_input=user_input, source=source)
         except DailyRecordServiceError as exc:
-            await update.message.reply_text(f"添加任务失败：{exc}")
+            await update.message.reply_text(f"添加记录失败：{exc}", reply_markup=MAIN_KEYBOARD)
             return False
 
         task_lines = [f"{index}. {task['title']}" for index, task in enumerate(result["tasks"], start=1)]
         message = (
-            "已添加到今天的任务：\n\n"
+            "已添加到今天的记录：\n\n"
             + "\n".join(task_lines)
-            + f"\n\n你今天目前共有 {result['task_count']} 个任务。"
+            + f"\n\n你今天目前一共记录了 {result['task_count']} 个任务。"
         )
-        await update.message.reply_text(message)
+        await update.message.reply_text(message, reply_markup=MAIN_KEYBOARD)
         return True
 
     async def _handle_review_input(self, update: Update, review_input: str, source: str) -> bool:
         try:
             review = await self.daily_record_service.handle_review_input(review_input=review_input, source=source)
         except DailyRecordServiceError as exc:
-            await update.message.reply_text(f"复盘写入失败：{exc}")
+            await update.message.reply_text(f"回顾写入失败：{exc}", reply_markup=MAIN_KEYBOARD)
             return False
 
         message = (
-            "我已经整理好今天的任务完成情况。\n\n"
+            "我已经整理好今天的完成情况。\n"
             f"今日完成度：{review.get('completion_score', 0)}%\n\n"
             "接下来，请简单写一下今天的感受、反思或收获。\n"
             "可以是一句话，也可以是一段语音。"
         )
-        await update.message.reply_text(message)
+        await update.message.reply_text(message, reply_markup=MAIN_KEYBOARD)
         return True
 
     async def _handle_reflection_input(self, update: Update, reflection_input: str, source: str) -> bool:
@@ -275,7 +320,7 @@ class TelegramDailyAssistantBot:
                 source=source,
             )
         except DailyRecordServiceError as exc:
-            await update.message.reply_text(f"反思写入失败：{exc}")
+            await update.message.reply_text(f"反思写入失败：{exc}", reply_markup=MAIN_KEYBOARD)
             return False
 
         message = (
@@ -288,7 +333,7 @@ class TelegramDailyAssistantBot:
             "- 今日反思\n\n"
             "明天可以继续从这些未完成事项开始。"
         )
-        await update.message.reply_text(message)
+        await update.message.reply_text(message, reply_markup=MAIN_KEYBOARD)
         return True
 
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
