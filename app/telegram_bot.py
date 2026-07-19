@@ -20,6 +20,7 @@ from app.daily_record_service import DailyRecordService, DailyRecordServiceError
 from app.speech_client import SpeechClient
 from app.state_manager import StateManager
 from app.storage import Storage
+from app.weekly_report import WeeklyReportService
 
 
 logger = logging.getLogger(__name__)
@@ -27,13 +28,15 @@ logger = logging.getLogger(__name__)
 TAB_RECORD = "记录"
 TAB_REVIEW = "回顾"
 TAB_REFLECTION = "反思"
+TAB_WEEKLY = "周报"
 
 HELP_TEXT = """欢迎使用每日记录助手。
 
-底部有 3 个常用入口：
+底部有 4 个常用入口：
 - 记录：记录今天早上的安排、任务或计划
 - 回顾：记录当天的完成情况
 - 反思：记录今天的感受、收获和改进点
+- 周报：生成上一周（周一到周日）的 PDF 周报
 
 也可以继续使用这些命令：
 /start - 显示欢迎信息
@@ -41,6 +44,7 @@ HELP_TEXT = """欢迎使用每日记录助手。
 /today - 查看今天已记录的任务
 /review - 手动开始当天回顾
 /reflection - 手动开始今天反思
+/weekly - 生成上一周的 PDF 周报
 /help - 显示帮助信息
 
 你也可以直接发送文字或语音：
@@ -49,7 +53,14 @@ HELP_TEXT = """欢迎使用每日记录助手。
 - 进入“反思”后，会把输入理解为今天的收获与思考"""
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(TAB_RECORD), KeyboardButton(TAB_REVIEW), KeyboardButton(TAB_REFLECTION)]],
+    keyboard=[
+        [
+            KeyboardButton(TAB_RECORD),
+            KeyboardButton(TAB_REVIEW),
+            KeyboardButton(TAB_REFLECTION),
+            KeyboardButton(TAB_WEEKLY),
+        ]
+    ],
     resize_keyboard=True,
     is_persistent=True,
 )
@@ -63,12 +74,14 @@ class TelegramDailyAssistantBot:
         speech_client: SpeechClient,
         state_manager: StateManager,
         storage: Storage,
+        weekly_report_service: WeeklyReportService,
     ) -> None:
         self.settings = settings
         self.daily_record_service = daily_record_service
         self.speech_client = speech_client
         self.state_manager = state_manager
         self.storage = storage
+        self.weekly_report_service = weekly_report_service
         self.application: Application | None = None
 
     def build_application(self, post_init=None, post_shutdown=None) -> Application:
@@ -85,6 +98,7 @@ class TelegramDailyAssistantBot:
         application.add_handler(CommandHandler("today", self.today_command))
         application.add_handler(CommandHandler("review", self.review_command))
         application.add_handler(CommandHandler("reflection", self.reflection_command))
+        application.add_handler(CommandHandler("weekly", self.weekly_command))
         application.add_handler(MessageHandler(filters.VOICE, self.voice_message_handler))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_message_handler))
         application.add_error_handler(self.error_handler)
@@ -150,6 +164,33 @@ class TelegramDailyAssistantBot:
             reply_markup=MAIN_KEYBOARD,
         )
 
+    async def weekly_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._is_authorized(update):
+            return
+        await update.message.reply_text(
+            "正在生成上一周的周报，大约需要十几秒，请稍等……",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        await update.message.chat.send_action(action=ChatAction.UPLOAD_DOCUMENT)
+        try:
+            pdf_path, week_start, week_end = await self.weekly_report_service.generate()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Weekly report generation failed")
+            await update.message.reply_text(f"周报生成失败：{exc}", reply_markup=MAIN_KEYBOARD)
+            return
+
+        caption = f"这是你 {week_start.strftime('%m月%d日')} 至 {week_end.strftime('%m月%d日')} 的周报。"
+        try:
+            with open(pdf_path, "rb") as pdf_file:
+                await update.message.reply_document(
+                    document=pdf_file,
+                    filename=pdf_path.name,
+                    caption=caption,
+                    reply_markup=MAIN_KEYBOARD,
+                )
+        finally:
+            pdf_path.unlink(missing_ok=True)
+
     async def text_message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
             return
@@ -168,6 +209,10 @@ class TelegramDailyAssistantBot:
 
         if text == TAB_REFLECTION:
             await self.reflection_command(update, context)
+            return
+
+        if text == TAB_WEEKLY:
+            await self.weekly_command(update, context)
             return
 
         await self._route_user_input(update, text, source="Telegram Text")

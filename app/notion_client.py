@@ -36,6 +36,24 @@ class NotionDailyRecordsClient:
             logger.exception("Notion query failed")
             raise NotionClientError(f"Notion query failed: {exc}") from exc
 
+    async def find_records_in_range(self, start_date: str, end_date: str) -> list[dict[str, Any]]:
+        try:
+            response = await self.client.databases.query(
+                database_id=self.database_id,
+                filter={
+                    "and": [
+                        {"property": "Date", "date": {"on_or_after": start_date}},
+                        {"property": "Date", "date": {"on_or_before": end_date}},
+                    ]
+                },
+                sorts=[{"property": "Date", "direction": "ascending"}],
+                page_size=100,
+            )
+            return response.get("results", [])
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Notion range query failed")
+            raise NotionClientError(f"Notion range query failed: {exc}") from exc
+
     async def create_daily_record(self, record_date: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             return await self.client.pages.create(

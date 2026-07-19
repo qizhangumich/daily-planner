@@ -15,6 +15,7 @@ from app.state_manager import StateManager
 from app.storage import Storage
 from app.task_parser import TaskParser
 from app.telegram_bot import TelegramDailyAssistantBot
+from app.weekly_report import WeeklyReportService
 
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,15 @@ def main() -> None:
     )
     scheduler = DailyScheduler(settings)
 
+    weekly_report_service = WeeklyReportService(
+        notion_client=notion_client,
+        openai_client=openai_client,
+        storage=storage,
+        timezone_name=settings.timezone,
+        prompts_dir=settings.prompts_dir,
+        data_dir=settings.data_dir,
+    )
+
     state_manager = StateManager(storage)
     bot = TelegramDailyAssistantBot(
         settings=settings,
@@ -53,6 +63,7 @@ def main() -> None:
         speech_client=speech_client,
         state_manager=state_manager,
         storage=storage,
+        weekly_report_service=weekly_report_service,
     )
 
     async def post_init(app) -> None:
