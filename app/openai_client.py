@@ -34,12 +34,16 @@ class OpenAIClient:
             logger.exception("OpenAI text generation failed")
             raise OpenAIClientError(f"OpenAI text generation failed: {exc}") from exc
 
-    async def transcribe_audio(self, audio_path: str) -> str:
+    async def transcribe_audio(self, audio_path: str, prompt: str = "") -> str:
         try:
+            kwargs: dict[str, Any] = {}
+            if prompt:
+                kwargs["prompt"] = prompt
             with open(audio_path, "rb") as audio_file:
                 transcript = await self.client.audio.transcriptions.create(
                     model=self.settings.openai_audio_model,
                     file=audio_file,
+                    **kwargs,
                 )
             return transcript.text.strip()
         except Exception as exc:  # noqa: BLE001

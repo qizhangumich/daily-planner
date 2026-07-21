@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from app.notion_client import NotionClientError, NotionDailyRecordsClient
+from app.openai_client import OpenAIClient
 from app.reflection_parser import ReflectionParser
 from app.review_parser import ReviewParser
 from app.storage import Storage
@@ -28,6 +31,8 @@ class DailyRecordService:
         reflection_parser: ReflectionParser,
         storage: Storage,
         timezone_name: str,
+        openai_client: Optional[OpenAIClient] = None,
+        prompts_dir: Optional[Path] = None,
     ) -> None:
         self.notion_client = notion_client
         self.task_parser = task_parser
@@ -35,6 +40,11 @@ class DailyRecordService:
         self.reflection_parser = reflection_parser
         self.storage = storage
         self.timezone = ZoneInfo(timezone_name)
+        self.openai_client = openai_client
+        self.prompts_dir = prompts_dir
+
+    def glossary_text(self) -> str:
+        return "、".join(self.storage.list_glossary_terms())
 
     def today(self) -> str:
         return datetime.now(self.timezone).date().isoformat()
@@ -42,15 +52,40 @@ class DailyRecordService:
     def now_iso(self) -> str:
         return datetime.now(self.timezone).isoformat()
 
-    async def add_task_to_today(self, user_input: str, source: str) -> dict[str, Any]:
-        record_date = self.today()
-        payload, page_id = await self._load_or_create_payload(record_date)
-
+    async def parse_tasks(self, user_input: str) -> dict[str, Any]:
         try:
-            parsed = await self.task_parser.parse(user_input=user_input, date_text=record_date)
+            return await self.task_parser.parse(
+                user_input=user_input,
+                date_text=self.today(),
+                glossary_text=self.glossary_text(),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Task parsing failed")
             raise DailyRecordServiceError(f"Failed to parse task: {exc}") from exc
+
+    async def apply_correction(self, parsed: dict[str, Any], correction: str) -> dict[str, Any]:
+        if self.openai_client is None or self.prompts_dir is None:
+            raise DailyRecordServiceError("Correction support is not configured.")
+        try:
+            template = (self.prompts_dir / "apply_correction.md").read_text(encoding="utf-8")
+            prompt = template.replace(
+                "{{parsed_json}}", json.dumps(parsed, ensure_ascii=False, indent=2)
+            ).replace("{{correction}}", correction)
+            glossary = self.glossary_text()
+            if glossary:
+                prompt += f"\n\n已知专有名词表（输出时必须严格使用以下拼写）：\n{glossary}"
+            return await self.openai_client.generate_json(prompt)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Applying correction failed")
+            raise DailyRecordServiceError(f"Failed to apply correction: {exc}") from exc
+
+    async def add_task_to_today(self, user_input: str, source: str) -> dict[str, Any]:
+        parsed = await self.parse_tasks(user_input)
+        return await self.commit_tasks(parsed, user_input, source)
+
+    async def commit_tasks(self, parsed: dict[str, Any], user_input: str, source: str) -> dict[str, Any]:
+        record_date = self.today()
+        payload, page_id = await self._load_or_create_payload(record_date)
 
         new_tasks = []
         existing_count = len(payload["tasks"])
@@ -103,15 +138,26 @@ class DailyRecordService:
         await self._save_payload(record_date, page_id, payload)
         return payload
 
-    async def handle_review_input(self, review_input: str, source: str) -> dict[str, Any]:
+    async def parse_review(self, review_input: str) -> dict[str, Any]:
         record_date = self.today()
-        payload, page_id = await self._load_or_create_payload(record_date)
-
+        payload, _ = await self._load_or_create_payload(record_date)
         try:
-            review_result = await self.review_parser.parse(payload, review_input)
+            return await self.review_parser.parse(
+                payload, review_input, glossary_text=self.glossary_text()
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Review parsing failed")
             raise DailyRecordServiceError(f"Failed to parse review: {exc}") from exc
+
+    async def handle_review_input(self, review_input: str, source: str) -> dict[str, Any]:
+        review_result = await self.parse_review(review_input)
+        return await self.commit_review(review_result, review_input, source)
+
+    async def commit_review(
+        self, review_result: dict[str, Any], review_input: str, source: str
+    ) -> dict[str, Any]:
+        record_date = self.today()
+        payload, page_id = await self._load_or_create_payload(record_date)
 
         task_status_map = {
             item.get("task_title"): item.get("status", "Unknown")
@@ -139,18 +185,28 @@ class DailyRecordService:
         await self._save_payload(record_date, page_id, payload)
         return payload["review"]
 
-    async def handle_reflection_input(self, reflection_input: str, source: str) -> dict[str, Any]:
+    async def parse_reflection(self, reflection_input: str) -> dict[str, Any]:
         record_date = self.today()
-        payload, page_id = await self._load_or_create_payload(record_date)
-
+        payload, _ = await self._load_or_create_payload(record_date)
         try:
-            reflection = await self.reflection_parser.parse(
+            return await self.reflection_parser.parse(
                 reflection_input=reflection_input,
                 review_summary=payload.get("review", {}).get("summary", ""),
+                glossary_text=self.glossary_text(),
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Reflection parsing failed")
             raise DailyRecordServiceError(f"Failed to parse reflection: {exc}") from exc
+
+    async def handle_reflection_input(self, reflection_input: str, source: str) -> dict[str, Any]:
+        reflection = await self.parse_reflection(reflection_input)
+        return await self.commit_reflection(reflection, reflection_input, source)
+
+    async def commit_reflection(
+        self, reflection: dict[str, Any], reflection_input: str, source: str
+    ) -> dict[str, Any]:
+        record_date = self.today()
+        payload, page_id = await self._load_or_create_payload(record_date)
 
         payload["reflection"] = reflection
         payload["reflection_input"] = reflection_input

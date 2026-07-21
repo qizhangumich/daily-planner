@@ -4,11 +4,18 @@ import logging
 import tempfile
 from pathlib import Path
 
-from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -45,7 +52,13 @@ HELP_TEXT = """欢迎使用每日记录助手。
 /review - 手动开始当天回顾
 /reflection - 手动开始今天反思
 /weekly - 生成上一周的 PDF 周报
+/names - 管理专有名词表（公司/人名/项目）
 /help - 显示帮助信息
+
+写入 Notion 前会先给你预览：
+- 点“✅ 写入”确认保存
+- 点“✏️ 修改”或直接回复文字来纠正内容（比如改错的公司名）
+- 点“❌ 取消”放弃这条记录
 
 你也可以直接发送文字或语音：
 - 默认会作为“记录”内容处理
@@ -63,6 +76,16 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
     is_persistent=True,
+)
+
+CONFIRM_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("✅ 写入", callback_data="pending:confirm"),
+            InlineKeyboardButton("✏️ 修改", callback_data="pending:edit"),
+            InlineKeyboardButton("❌ 取消", callback_data="pending:cancel"),
+        ]
+    ]
 )
 
 
@@ -83,6 +106,7 @@ class TelegramDailyAssistantBot:
         self.storage = storage
         self.weekly_report_service = weekly_report_service
         self.application: Application | None = None
+        self._pending: dict | None = None
 
     def build_application(self, post_init=None, post_shutdown=None) -> Application:
         builder = ApplicationBuilder().token(self.settings.telegram_bot_token)
@@ -99,6 +123,8 @@ class TelegramDailyAssistantBot:
         application.add_handler(CommandHandler("review", self.review_command))
         application.add_handler(CommandHandler("reflection", self.reflection_command))
         application.add_handler(CommandHandler("weekly", self.weekly_command))
+        application.add_handler(CommandHandler("names", self.names_command))
+        application.add_handler(CallbackQueryHandler(self.pending_callback, pattern=r"^pending:"))
         application.add_handler(MessageHandler(filters.VOICE, self.voice_message_handler))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_message_handler))
         application.add_error_handler(self.error_handler)
@@ -199,6 +225,10 @@ class TelegramDailyAssistantBot:
             await update.message.reply_text("我没有收到有效文字内容，请再发一次。", reply_markup=MAIN_KEYBOARD)
             return
 
+        if text in {TAB_RECORD, TAB_REVIEW, TAB_REFLECTION, TAB_WEEKLY}:
+            # Switching tabs abandons any unconfirmed preview.
+            self._pending = None
+
         if text == TAB_RECORD:
             await self.add_command(update, context)
             return
@@ -252,7 +282,10 @@ class TelegramDailyAssistantBot:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as temp_file:
                 temp_path = Path(temp_file.name)
             await telegram_file.download_to_drive(custom_path=str(temp_path))
-            return await self.speech_client.transcribe(str(temp_path))
+            return await self.speech_client.transcribe(
+                str(temp_path),
+                vocabulary_hint=self.daily_record_service.glossary_text(),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Telegram voice transcription failed")
             raise DailyRecordServiceError(f"Failed to transcribe Telegram voice: {exc}") from exc
@@ -304,82 +337,225 @@ class TelegramDailyAssistantBot:
         state = self.state_manager.get_state(self.settings.telegram_user_id)
         await update.message.chat.send_action(action=ChatAction.TYPING)
 
-        if state in {"idle", "adding_task"}:
-            success = await self._handle_task_input(update, user_input, source)
-            if success:
-                self.state_manager.set_state(self.settings.telegram_user_id, "idle")
+        if self._pending is not None:
+            await self._apply_pending_correction(update, user_input)
             return
 
         if state == "awaiting_review":
-            success = await self._handle_review_input(update, user_input, source)
-            if success:
-                self.state_manager.set_state(self.settings.telegram_user_id, "awaiting_reflection")
+            await self._prepare_pending(update, kind="review", user_input=user_input, source=source)
             return
 
         if state == "awaiting_reflection":
-            success = await self._handle_reflection_input(update, user_input, source)
-            if success:
-                self.state_manager.set_state(self.settings.telegram_user_id, "idle")
+            await self._prepare_pending(update, kind="reflection", user_input=user_input, source=source)
             return
 
-        success = await self._handle_task_input(update, user_input, source)
-        if success:
-            self.state_manager.set_state(self.settings.telegram_user_id, "idle")
+        await self._prepare_pending(update, kind="task", user_input=user_input, source=source)
 
-    async def _handle_task_input(self, update: Update, user_input: str, source: str) -> bool:
+    async def _prepare_pending(self, update: Update, kind: str, user_input: str, source: str) -> None:
         try:
-            result = await self.daily_record_service.add_task_to_today(user_input=user_input, source=source)
+            if kind == "task":
+                parsed = await self.daily_record_service.parse_tasks(user_input)
+            elif kind == "review":
+                parsed = await self.daily_record_service.parse_review(user_input)
+            else:
+                parsed = await self.daily_record_service.parse_reflection(user_input)
         except DailyRecordServiceError as exc:
-            await update.message.reply_text(f"添加记录失败：{exc}", reply_markup=MAIN_KEYBOARD)
-            return False
+            await update.message.reply_text(f"内容解析失败：{exc}", reply_markup=MAIN_KEYBOARD)
+            return
 
-        task_lines = [f"{index}. {task['title']}" for index, task in enumerate(result["tasks"], start=1)]
-        message = (
-            "已添加到今天的记录：\n\n"
-            + "\n".join(task_lines)
-            + f"\n\n你今天目前一共记录了 {result['task_count']} 个任务。"
+        self._pending = {"kind": kind, "parsed": parsed, "raw": user_input, "source": source}
+        await update.message.reply_text(
+            self._format_preview(kind, parsed),
+            reply_markup=CONFIRM_KEYBOARD,
         )
-        await update.message.reply_text(message, reply_markup=MAIN_KEYBOARD)
-        return True
 
-    async def _handle_review_input(self, update: Update, review_input: str, source: str) -> bool:
+    async def _apply_pending_correction(self, update: Update, correction: str) -> None:
+        assert self._pending is not None
         try:
-            review = await self.daily_record_service.handle_review_input(review_input=review_input, source=source)
-        except DailyRecordServiceError as exc:
-            await update.message.reply_text(f"回顾写入失败：{exc}", reply_markup=MAIN_KEYBOARD)
-            return False
-
-        message = (
-            "我已经整理好今天的完成情况。\n"
-            f"今日完成度：{review.get('completion_score', 0)}%\n\n"
-            "接下来，请简单写一下今天的感受、反思或收获。\n"
-            "可以是一句话，也可以是一段语音。"
-        )
-        await update.message.reply_text(message, reply_markup=MAIN_KEYBOARD)
-        return True
-
-    async def _handle_reflection_input(self, update: Update, reflection_input: str, source: str) -> bool:
-        try:
-            await self.daily_record_service.handle_reflection_input(
-                reflection_input=reflection_input,
-                source=source,
+            corrected = await self.daily_record_service.apply_correction(
+                self._pending["parsed"], correction
             )
         except DailyRecordServiceError as exc:
-            await update.message.reply_text(f"反思写入失败：{exc}", reply_markup=MAIN_KEYBOARD)
-            return False
+            await update.message.reply_text(
+                f"修改失败：{exc}\n可以再试一次，或点“❌ 取消”。",
+                reply_markup=CONFIRM_KEYBOARD,
+            )
+            return
 
-        message = (
-            "今天的记录已经完成。\n\n"
-            "已写入 Notion：\n"
-            "- 今日任务\n"
-            "- 任务完成情况\n"
-            "- 今日完成度\n"
-            "- 明日延续事项\n"
-            "- 今日反思\n\n"
-            "明天可以继续从这些未完成事项开始。"
+        self._pending["parsed"] = corrected
+        await update.message.reply_text(
+            "已按你的意见修改：\n\n" + self._format_preview(self._pending["kind"], corrected),
+            reply_markup=CONFIRM_KEYBOARD,
         )
-        await update.message.reply_text(message, reply_markup=MAIN_KEYBOARD)
-        return True
+
+    @staticmethod
+    def _format_preview(kind: str, parsed: dict) -> str:
+        if kind == "task":
+            tasks = parsed.get("tasks", [])
+            lines = [
+                f"{index}. {task.get('title', '')} [{task.get('priority', 'P2')}] ({task.get('category', 'Other')})"
+                for index, task in enumerate(tasks, start=1)
+            ]
+            body = "\n".join(lines) if lines else "（没有解析出任务）"
+            return (
+                "以下任务将写入 Notion：\n\n"
+                f"{body}\n\n"
+                "确认写入吗？如果有错（比如公司名），直接回复修改意见即可。"
+            )
+
+        if kind == "review":
+            lines = [f"今日完成度：{parsed.get('completion_score', 0)}%"]
+            if parsed.get("overall_summary"):
+                lines.append(f"总结：{parsed['overall_summary']}")
+            completed = parsed.get("completed_tasks", [])
+            unfinished = parsed.get("unfinished_tasks", [])
+            if completed:
+                lines.append("\n已完成：")
+                lines.extend(f"- {item}" for item in completed)
+            if unfinished:
+                lines.append("\n未完成：")
+                lines.extend(f"- {item}" for item in unfinished)
+            if parsed.get("suggestion_for_tomorrow"):
+                lines.append(f"\n明日建议：{parsed['suggestion_for_tomorrow']}")
+            return (
+                "以下回顾将写入 Notion：\n\n"
+                + "\n".join(lines)
+                + "\n\n确认写入吗？如果有错，直接回复修改意见即可。"
+            )
+
+        labels = [
+            ("feeling", "感受"),
+            ("insight", "收获"),
+            ("problem", "问题"),
+            ("improvement", "改进"),
+            ("reflection_summary", "小结"),
+        ]
+        lines = [
+            f"{label}：{str(parsed.get(key, '')).strip()}"
+            for key, label in labels
+            if str(parsed.get(key, "")).strip()
+        ]
+        body = "\n".join(lines) if lines else "（没有解析出内容）"
+        return (
+            "以下反思将写入 Notion：\n\n"
+            f"{body}\n\n"
+            "确认写入吗？如果有错，直接回复修改意见即可。"
+        )
+
+    async def pending_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        user = query.from_user
+        if user is None or user.id != self.settings.telegram_user_id:
+            await query.answer("Not authorized.")
+            return
+        await query.answer()
+
+        action = query.data.split(":", 1)[1]
+        if self._pending is None:
+            await query.edit_message_text("这条记录已经处理过了。")
+            return
+
+        kind = self._pending["kind"]
+
+        if action == "cancel":
+            self._pending = None
+            restore = {"review": "awaiting_review", "reflection": "awaiting_reflection"}.get(kind, "idle")
+            self.state_manager.set_state(self.settings.telegram_user_id, restore)
+            await query.edit_message_text("已取消，这条记录没有写入 Notion。可以重新发送内容。")
+            return
+
+        if action == "edit":
+            await query.edit_message_text(
+                query.message.text + "\n\n✏️ 请直接回复需要修改的地方（例如：公司名应该是 XX）。",
+                reply_markup=CONFIRM_KEYBOARD,
+            )
+            return
+
+        # action == "confirm"
+        pending = self._pending
+        try:
+            if kind == "task":
+                result = await self.daily_record_service.commit_tasks(
+                    pending["parsed"], pending["raw"], pending["source"]
+                )
+                self._pending = None
+                self.state_manager.set_state(self.settings.telegram_user_id, "idle")
+                task_lines = [
+                    f"{index}. {task['title']}" for index, task in enumerate(result["tasks"], start=1)
+                ]
+                message = (
+                    "已写入 Notion：\n\n"
+                    + "\n".join(task_lines)
+                    + f"\n\n你今天目前一共记录了 {result['task_count']} 个任务。"
+                )
+            elif kind == "review":
+                review = await self.daily_record_service.commit_review(
+                    pending["parsed"], pending["raw"], pending["source"]
+                )
+                self._pending = None
+                self.state_manager.set_state(self.settings.telegram_user_id, "awaiting_reflection")
+                message = (
+                    "回顾已写入 Notion。\n"
+                    f"今日完成度：{review.get('completion_score', 0)}%\n\n"
+                    "接下来，请简单写一下今天的感受、反思或收获。\n"
+                    "可以是一句话，也可以是一段语音。"
+                )
+            else:
+                await self.daily_record_service.commit_reflection(
+                    pending["parsed"], pending["raw"], pending["source"]
+                )
+                self._pending = None
+                self.state_manager.set_state(self.settings.telegram_user_id, "idle")
+                message = (
+                    "今天的记录已经完成。\n\n"
+                    "已写入 Notion：\n"
+                    "- 今日任务\n"
+                    "- 任务完成情况\n"
+                    "- 今日完成度\n"
+                    "- 明日延续事项\n"
+                    "- 今日反思\n\n"
+                    "明天可以继续从这些未完成事项开始。"
+                )
+        except DailyRecordServiceError as exc:
+            await query.edit_message_text(
+                query.message.text + f"\n\n⚠️ 写入失败：{exc}\n可以再点一次“✅ 写入”重试。",
+                reply_markup=CONFIRM_KEYBOARD,
+            )
+            return
+
+        await query.edit_message_text(message)
+
+    async def names_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._is_authorized(update):
+            return
+        args = context.args or []
+
+        if args and args[0].lower() in {"add", "加", "添加"} and len(args) > 1:
+            term = " ".join(args[1:]).strip()
+            self.storage.add_glossary_term(term)
+            await update.message.reply_text(f"已添加到名词表：{term}", reply_markup=MAIN_KEYBOARD)
+            return
+
+        if args and args[0].lower() in {"del", "delete", "remove", "删", "删除"} and len(args) > 1:
+            term = " ".join(args[1:]).strip()
+            if self.storage.delete_glossary_term(term):
+                await update.message.reply_text(f"已从名词表删除：{term}", reply_markup=MAIN_KEYBOARD)
+            else:
+                await update.message.reply_text(f"名词表里没有找到：{term}", reply_markup=MAIN_KEYBOARD)
+            return
+
+        terms = self.storage.list_glossary_terms()
+        listing = "\n".join(f"- {term}" for term in terms) if terms else "（还没有添加任何名词）"
+        await update.message.reply_text(
+            "专有名词表（语音转写和解析时会按这些拼写输出）：\n\n"
+            f"{listing}\n\n"
+            "用法：\n"
+            "/names add 名词 - 添加（公司、人名、项目名）\n"
+            "/names del 名词 - 删除",
+            reply_markup=MAIN_KEYBOARD,
+        )
 
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("Telegram application error", exc_info=context.error)

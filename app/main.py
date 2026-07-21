@@ -44,6 +44,8 @@ def main() -> None:
         reflection_parser=reflection_parser,
         storage=storage,
         timezone_name=settings.timezone,
+        openai_client=openai_client,
+        prompts_dir=settings.prompts_dir,
     )
     scheduler = DailyScheduler(settings)
 

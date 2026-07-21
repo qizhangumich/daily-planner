@@ -38,6 +38,11 @@ class Storage:
                     message TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS glossary_terms (
+                    term TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -104,6 +109,28 @@ class Storage:
                 "DELETE FROM daily_cache WHERE record_date = ?",
                 (record_date,),
             )
+
+    def add_glossary_term(self, term: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT OR IGNORE INTO glossary_terms (term, created_at) VALUES (?, ?)",
+                (term.strip(), self._now()),
+            )
+
+    def delete_glossary_term(self, term: str) -> bool:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "DELETE FROM glossary_terms WHERE term = ?",
+                (term.strip(),),
+            )
+        return cursor.rowcount > 0
+
+    def list_glossary_terms(self) -> list[str]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT term FROM glossary_terms ORDER BY term"
+            ).fetchall()
+        return [row["term"] for row in rows]
 
     def append_event_log(self, level: str, message: str) -> None:
         with self._lock, self._connection:
