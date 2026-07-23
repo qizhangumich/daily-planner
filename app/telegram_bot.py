@@ -393,7 +393,7 @@ class TelegramDailyAssistantBot:
         if kind == "task":
             tasks = parsed.get("tasks", [])
             lines = [
-                f"{index}. {task.get('title', '')} [{task.get('priority', 'P2')}] ({task.get('category', 'Other')})"
+                f"{index}. {task.get('title', '')} [{task.get('priority', 'P2')}] ({task.get('category', 'W1')})"
                 for index, task in enumerate(tasks, start=1)
             ]
             body = "\n".join(lines) if lines else "（没有解析出任务）"
