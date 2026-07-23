@@ -158,9 +158,11 @@ class NotionDailyRecordsClient:
         lines: list[str] = []
         for index, task in enumerate(tasks, start=1):
             title = task.get("title", "Untitled Task")
+            category = (task.get("category") or "").strip()
             notes = (task.get("notes") or "").strip()
 
-            lines.append(f"{index}. {title}")
+            suffix = f" ({category})" if category else ""
+            lines.append(f"{index}. {title}{suffix}")
             if notes:
                 lines.append(f"   {notes}")
             lines.append("")
