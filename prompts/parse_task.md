@@ -6,16 +6,14 @@
 1. 保留用户原意，不要过度扩写。
 2. 如果一句话里包含多个任务，请拆分成多个任务。
 3. 如果用户只是补充一个临时想法，也要整理成可执行任务。
-4. 每个任务需要包含 title、category、priority、estimated_time_minutes、notes。
+4. 每个任务需要包含 title、category、estimated_time_minutes、notes。
 5. category 从以下选项中选择（必须四选一）：
    - W1：本职工作（拿薪水的主业工作）
    - W2：个人生意（自己的公司/业务）
    - W3：机会型尝试（opportunity bets，新机会、投资、探索性项目）
    - P：家庭与个人（孩子、家人、个人锻炼、健康、生活事务）
-6. 如果一个任务同时涉及多类，选择最主要的那一类；无法判断时优先考虑 W1。
-7. priority 从 P1 / P2 / P3 中选择。
-8. 如果无法判断优先级，默认为 P2。
-9. 输出必须是 JSON，不要输出解释文字。
+6. 如果一个任务同时涉及多类，选择最主要的那一类；无法判断时默认 W2（用户的大部分任务属于 W2）。
+7. 输出必须是 JSON，不要输出解释文字。
 
 用户输入：
 {{user_input}}
@@ -29,8 +27,7 @@
   "tasks": [
     {
       "title": "...",
-      "category": "W1",
-      "priority": "P2",
+      "category": "W2",
       "estimated_time_minutes": 60,
       "notes": "..."
     }

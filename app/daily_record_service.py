@@ -94,8 +94,7 @@ class DailyRecordService:
                 {
                     "id": f"task_{existing_count + index:03d}",
                     "title": task.get("title", "Untitled Task"),
-                    "category": task.get("category", "W1"),
-                    "priority": task.get("priority", "P2"),
+                    "category": task.get("category", "W2"),
                     "status": "Planned",
                     "estimated_time_minutes": task.get("estimated_time_minutes", 0),
                     "created_at": self.now_iso(),

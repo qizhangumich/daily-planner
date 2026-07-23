@@ -168,7 +168,7 @@ class TelegramDailyAssistantBot:
             return
 
         lines = [
-            f"{index}. {task['title']} [{task['priority']}] ({task['status']})"
+            f"{index}. {task['title']} ({task.get('category', 'W2')}) - {task.get('status', 'Planned')}"
             for index, task in enumerate(tasks, start=1)
         ]
         await update.message.reply_text(
@@ -393,7 +393,7 @@ class TelegramDailyAssistantBot:
         if kind == "task":
             tasks = parsed.get("tasks", [])
             lines = [
-                f"{index}. {task.get('title', '')} [{task.get('priority', 'P2')}] ({task.get('category', 'W1')})"
+                f"{index}. {task.get('title', '')} ({task.get('category', 'W2')})"
                 for index, task in enumerate(tasks, start=1)
             ]
             body = "\n".join(lines) if lines else "（没有解析出任务）"
