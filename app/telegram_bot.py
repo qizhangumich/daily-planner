@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import tempfile
+from datetime import date
 from pathlib import Path
+from typing import Optional
 
 from telegram import (
     InlineKeyboardButton,
@@ -131,6 +133,24 @@ class TelegramDailyAssistantBot:
         self.application = application
         return application
 
+    def _date_label(self, record_date: str) -> str:
+        delta = (date.fromisoformat(self.daily_record_service.today()) - date.fromisoformat(record_date)).days
+        if delta == 0:
+            return "今天"
+        if delta == 1:
+            return "昨天"
+        if delta == 2:
+            return "前天"
+        return f"{record_date[5:7]}月{record_date[8:10]}日"
+
+    @staticmethod
+    def _parse_state(state: str) -> tuple[str, Optional[str]]:
+        """States like 'awaiting_review@2026-07-26' carry the day being reviewed."""
+        if "@" in state:
+            name, iso = state.split("@", 1)
+            return name, iso
+        return state, None
+
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
             return
@@ -184,9 +204,17 @@ class TelegramDailyAssistantBot:
     async def reflection_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
             return
-        self.state_manager.set_state(self.settings.telegram_user_id, "awaiting_reflection")
+        try:
+            target = (
+                await self.daily_record_service.latest_reflectable_date()
+                or self.daily_record_service.today()
+            )
+        except DailyRecordServiceError:
+            target = self.daily_record_service.today()
+        label = self._date_label(target)
+        self.state_manager.set_state(self.settings.telegram_user_id, f"awaiting_reflection@{target}")
         await update.message.reply_text(
-            "请直接回复今天的感受、反思或收获。可以是一句话，也可以是一段语音。",
+            f"请直接回复{label}的感受、反思或收获。可以是一句话，也可以是一段语音。",
             reply_markup=MAIN_KEYBOARD,
         )
 
@@ -303,34 +331,40 @@ class TelegramDailyAssistantBot:
             raise RuntimeError("Telegram application has not been initialized.")
 
         try:
-            payload = await self.daily_record_service.prepare_evening_review()
+            target = (
+                await self.daily_record_service.latest_reviewable_date()
+                or self.daily_record_service.today()
+            )
+            payload = await self.daily_record_service.prepare_evening_review(target)
         except DailyRecordServiceError as exc:
             await self.application.bot.send_message(
                 chat_id=chat_id,
-                text=f"今晚回顾提醒发送失败：{exc}",
+                text=f"回顾提醒发送失败：{exc}",
                 reply_markup=MAIN_KEYBOARD,
             )
             return
 
+        label = self._date_label(target)
+        catch_up = "" if label == "今天" else f"（{label} {target} 的任务还没有回顾，先补上吧）"
         tasks = payload.get("tasks", [])
         if tasks:
             lines = [f"{index}. {task['title']}" for index, task in enumerate(tasks, start=1)]
             task_text = "\n".join(lines)
             message = (
-                "今天的回顾时间到了。\n\n"
-                "你今天记录了以下任务：\n\n"
+                f"回顾时间到了。{catch_up}\n\n"
+                f"{label}记录了以下任务：\n\n"
                 f"{task_text}\n\n"
                 "请直接回复这些任务的完成情况。\n"
                 "你可以用文字，也可以用语音。"
             )
         else:
             message = (
-                "今天的回顾时间到了。\n\n"
+                "回顾时间到了。\n\n"
                 "今天还没有记录任务，你也可以直接做一次自由回顾。\n"
                 "请告诉我今天完成了什么、没完成什么，以及原因。"
             )
 
-        self.state_manager.set_state(self.settings.telegram_user_id, "awaiting_review")
+        self.state_manager.set_state(self.settings.telegram_user_id, f"awaiting_review@{target}")
         await self.application.bot.send_message(chat_id=chat_id, text=message, reply_markup=MAIN_KEYBOARD)
 
     async def _route_user_input(self, update: Update, user_input: str, source: str) -> None:
@@ -341,29 +375,43 @@ class TelegramDailyAssistantBot:
             await self._apply_pending_correction(update, user_input)
             return
 
-        if state == "awaiting_review":
-            await self._prepare_pending(update, kind="review", user_input=user_input, source=source)
+        state_name, state_date = self._parse_state(state)
+        if state_name == "awaiting_review":
+            await self._prepare_pending(
+                update, kind="review", user_input=user_input, source=source, record_date=state_date
+            )
             return
 
-        if state == "awaiting_reflection":
-            await self._prepare_pending(update, kind="reflection", user_input=user_input, source=source)
+        if state_name == "awaiting_reflection":
+            await self._prepare_pending(
+                update, kind="reflection", user_input=user_input, source=source, record_date=state_date
+            )
             return
 
         await self._prepare_pending(update, kind="task", user_input=user_input, source=source)
 
-    async def _prepare_pending(self, update: Update, kind: str, user_input: str, source: str) -> None:
+    async def _prepare_pending(
+        self, update: Update, kind: str, user_input: str, source: str,
+        record_date: Optional[str] = None,
+    ) -> None:
         try:
             if kind == "task":
                 parsed = await self.daily_record_service.parse_tasks(user_input)
             elif kind == "review":
-                parsed = await self.daily_record_service.parse_review(user_input)
+                parsed = await self.daily_record_service.parse_review(user_input, record_date)
             else:
-                parsed = await self.daily_record_service.parse_reflection(user_input)
+                parsed = await self.daily_record_service.parse_reflection(user_input, record_date)
         except DailyRecordServiceError as exc:
             await update.message.reply_text(f"内容解析失败：{exc}", reply_markup=MAIN_KEYBOARD)
             return
 
-        self._pending = {"kind": kind, "parsed": parsed, "raw": user_input, "source": source}
+        self._pending = {
+            "kind": kind,
+            "parsed": parsed,
+            "raw": user_input,
+            "source": source,
+            "record_date": record_date,
+        }
         await update.message.reply_text(
             self._format_preview(kind, parsed),
             reply_markup=CONFIRM_KEYBOARD,
@@ -458,10 +506,13 @@ class TelegramDailyAssistantBot:
             return
 
         kind = self._pending["kind"]
+        pending_date = self._pending.get("record_date")
 
         if action == "cancel":
             self._pending = None
             restore = {"review": "awaiting_review", "reflection": "awaiting_reflection"}.get(kind, "idle")
+            if restore != "idle" and pending_date:
+                restore = f"{restore}@{pending_date}"
             self.state_manager.set_state(self.settings.telegram_user_id, restore)
             await query.edit_message_text("已取消，这条记录没有写入 Notion。可以重新发送内容。")
             return
@@ -492,24 +543,28 @@ class TelegramDailyAssistantBot:
                 )
             elif kind == "review":
                 review = await self.daily_record_service.commit_review(
-                    pending["parsed"], pending["raw"], pending["source"]
+                    pending["parsed"], pending["raw"], pending["source"], pending_date
                 )
                 self._pending = None
-                self.state_manager.set_state(self.settings.telegram_user_id, "awaiting_reflection")
+                target = pending_date or self.daily_record_service.today()
+                label = self._date_label(target)
+                self.state_manager.set_state(
+                    self.settings.telegram_user_id, f"awaiting_reflection@{target}"
+                )
                 message = (
-                    "回顾已写入 Notion。\n"
-                    f"今日完成度：{review.get('completion_score', 0)}%\n\n"
-                    "接下来，请简单写一下今天的感受、反思或收获。\n"
+                    f"{label}的回顾已写入 Notion。\n"
+                    f"完成度：{review.get('completion_score', 0)}%\n\n"
+                    f"接下来，请简单写一下{label}的感受、反思或收获。\n"
                     "可以是一句话，也可以是一段语音。"
                 )
             else:
                 await self.daily_record_service.commit_reflection(
-                    pending["parsed"], pending["raw"], pending["source"]
+                    pending["parsed"], pending["raw"], pending["source"], pending_date
                 )
                 self._pending = None
                 self.state_manager.set_state(self.settings.telegram_user_id, "idle")
                 message = (
-                    "今天的记录已经完成。\n\n"
+                    "这一天的记录已经完成。\n\n"
                     "已写入 Notion：\n"
                     "- 今日任务\n"
                     "- 任务完成情况\n"

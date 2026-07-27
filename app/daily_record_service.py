@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -129,16 +129,66 @@ class DailyRecordService:
         payload, _ = await self._load_or_create_payload(record_date)
         return payload
 
-    async def prepare_evening_review(self) -> dict[str, Any]:
-        record_date = self.today()
+    @staticmethod
+    def _page_review_info(page: dict[str, Any]) -> Optional[tuple[str, bool, bool, bool]]:
+        """(record_date, has_tasks, is_reviewed, has_reflection) from a Notion query result."""
+        props = page.get("properties", {})
+        date_value = ((props.get("Date", {}).get("date") or {}).get("start") or "")[:10]
+        if not date_value:
+            return None
+        status = (props.get("Review Status", {}).get("select") or {}).get("name") or "Not Started"
+        tasks_text = "".join(
+            item.get("plain_text", "") for item in props.get("Tasks", {}).get("rich_text", [])
+        )
+        has_tasks = False
+        has_reflection = False
+        if tasks_text.strip().startswith("{"):
+            try:
+                payload = json.loads(tasks_text)
+                has_tasks = bool(payload.get("tasks"))
+                has_reflection = bool(payload.get("reflection"))
+            except json.JSONDecodeError:
+                pass
+        return date_value, has_tasks, status == "Reviewed", has_reflection
+
+    async def latest_reviewable_date(self, lookback_days: int = 60) -> Optional[str]:
+        """Most recent day with recorded tasks that has not been reviewed yet."""
+        today = self.today()
+        start = (date.fromisoformat(today) - timedelta(days=lookback_days)).isoformat()
+        try:
+            pages = await self.notion_client.find_records_in_range(start, today)
+        except NotionClientError as exc:
+            raise DailyRecordServiceError(f"Failed to look up unreviewed records: {exc}") from exc
+        for page in reversed(pages):  # ascending order -> reversed = newest first
+            info = self._page_review_info(page)
+            if info and info[1] and not info[2]:
+                return info[0]
+        return None
+
+    async def latest_reflectable_date(self, lookback_days: int = 60) -> Optional[str]:
+        """Most recent reviewed day that has no reflection yet."""
+        today = self.today()
+        start = (date.fromisoformat(today) - timedelta(days=lookback_days)).isoformat()
+        try:
+            pages = await self.notion_client.find_records_in_range(start, today)
+        except NotionClientError as exc:
+            raise DailyRecordServiceError(f"Failed to look up unreflected records: {exc}") from exc
+        for page in reversed(pages):
+            info = self._page_review_info(page)
+            if info and info[2] and not info[3]:
+                return info[0]
+        return None
+
+    async def prepare_evening_review(self, record_date: Optional[str] = None) -> dict[str, Any]:
+        record_date = record_date or self.today()
         payload, page_id = await self._load_or_create_payload(record_date)
         payload["review_status"] = "Waiting Review"
         payload["last_updated"] = self.now_iso()
         await self._save_payload(record_date, page_id, payload)
         return payload
 
-    async def parse_review(self, review_input: str) -> dict[str, Any]:
-        record_date = self.today()
+    async def parse_review(self, review_input: str, record_date: Optional[str] = None) -> dict[str, Any]:
+        record_date = record_date or self.today()
         payload, _ = await self._load_or_create_payload(record_date)
         try:
             return await self.review_parser.parse(
@@ -153,9 +203,10 @@ class DailyRecordService:
         return await self.commit_review(review_result, review_input, source)
 
     async def commit_review(
-        self, review_result: dict[str, Any], review_input: str, source: str
+        self, review_result: dict[str, Any], review_input: str, source: str,
+        record_date: Optional[str] = None,
     ) -> dict[str, Any]:
-        record_date = self.today()
+        record_date = record_date or self.today()
         payload, page_id = await self._load_or_create_payload(record_date)
 
         task_status_map = {
@@ -184,8 +235,8 @@ class DailyRecordService:
         await self._save_payload(record_date, page_id, payload)
         return payload["review"]
 
-    async def parse_reflection(self, reflection_input: str) -> dict[str, Any]:
-        record_date = self.today()
+    async def parse_reflection(self, reflection_input: str, record_date: Optional[str] = None) -> dict[str, Any]:
+        record_date = record_date or self.today()
         payload, _ = await self._load_or_create_payload(record_date)
         try:
             return await self.reflection_parser.parse(
@@ -202,9 +253,10 @@ class DailyRecordService:
         return await self.commit_reflection(reflection, reflection_input, source)
 
     async def commit_reflection(
-        self, reflection: dict[str, Any], reflection_input: str, source: str
+        self, reflection: dict[str, Any], reflection_input: str, source: str,
+        record_date: Optional[str] = None,
     ) -> dict[str, Any]:
-        record_date = self.today()
+        record_date = record_date or self.today()
         payload, page_id = await self._load_or_create_payload(record_date)
 
         payload["reflection"] = reflection
