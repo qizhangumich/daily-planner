@@ -140,43 +140,53 @@ class DailyRecordService:
         tasks_text = "".join(
             item.get("plain_text", "") for item in props.get("Tasks", {}).get("rich_text", [])
         )
-        has_tasks = False
+        stripped = tasks_text.strip()
+        has_tasks = bool(stripped)  # pages store a readable task list, not JSON
         has_reflection = False
-        if tasks_text.strip().startswith("{"):
+        if stripped.startswith("{"):  # legacy JSON payload pages
             try:
-                payload = json.loads(tasks_text)
+                payload = json.loads(stripped)
                 has_tasks = bool(payload.get("tasks"))
                 has_reflection = bool(payload.get("reflection"))
             except json.JSONDecodeError:
                 pass
         return date_value, has_tasks, status == "Reviewed", has_reflection
 
-    async def latest_reviewable_date(self, lookback_days: int = 60) -> Optional[str]:
-        """Most recent day with recorded tasks that has not been reviewed yet."""
+    async def _recent_day_states(self, lookback_days: int) -> list[tuple[str, bool, bool, bool]]:
+        """Newest-first (date, has_tasks, reviewed, has_reflection); local cache wins over Notion."""
         today = self.today()
         start = (date.fromisoformat(today) - timedelta(days=lookback_days)).isoformat()
         try:
             pages = await self.notion_client.find_records_in_range(start, today)
         except NotionClientError as exc:
-            raise DailyRecordServiceError(f"Failed to look up unreviewed records: {exc}") from exc
+            raise DailyRecordServiceError(f"Failed to look up recent records: {exc}") from exc
+
+        states: list[tuple[str, bool, bool, bool]] = []
         for page in reversed(pages):  # ascending order -> reversed = newest first
             info = self._page_review_info(page)
-            if info and info[1] and not info[2]:
-                return info[0]
+            if info is None:
+                continue
+            record_date, has_tasks, reviewed, has_reflection = info
+            cached = self.storage.get_daily_payload(record_date)
+            if cached is not None:
+                has_tasks = bool(cached.get("tasks"))
+                reviewed = cached.get("review_status") == "Reviewed"
+                has_reflection = bool(cached.get("reflection"))
+            states.append((record_date, has_tasks, reviewed, has_reflection))
+        return states
+
+    async def latest_reviewable_date(self, lookback_days: int = 60) -> Optional[str]:
+        """Most recent day with recorded tasks that has not been reviewed yet."""
+        for record_date, has_tasks, reviewed, _ in await self._recent_day_states(lookback_days):
+            if has_tasks and not reviewed:
+                return record_date
         return None
 
     async def latest_reflectable_date(self, lookback_days: int = 60) -> Optional[str]:
         """Most recent reviewed day that has no reflection yet."""
-        today = self.today()
-        start = (date.fromisoformat(today) - timedelta(days=lookback_days)).isoformat()
-        try:
-            pages = await self.notion_client.find_records_in_range(start, today)
-        except NotionClientError as exc:
-            raise DailyRecordServiceError(f"Failed to look up unreflected records: {exc}") from exc
-        for page in reversed(pages):
-            info = self._page_review_info(page)
-            if info and info[2] and not info[3]:
-                return info[0]
+        for record_date, _, reviewed, has_reflection in await self._recent_day_states(lookback_days):
+            if reviewed and not has_reflection:
+                return record_date
         return None
 
     async def prepare_evening_review(self, record_date: Optional[str] = None) -> dict[str, Any]:
