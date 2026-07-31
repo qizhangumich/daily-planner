@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import re
 import tempfile
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -158,6 +159,42 @@ class TelegramDailyAssistantBot:
             return f"📅 将记录到：{int(target[5:7])}月{int(target[8:10])}日（{self._date_label(target)}）\n"
         return ""
 
+    def _pending_date_line(self, kind: str, parsed: dict, record_date: Optional[str]) -> str:
+        if kind == "task":
+            return self._backfill_line(parsed)
+        if record_date and record_date != self.daily_record_service.today():
+            return (
+                f"📅 保存到：{int(record_date[5:7])}月{int(record_date[8:10])}日"
+                f"（{self._date_label(record_date)}）\n"
+            )
+        return ""
+
+    def _extract_date_mention(self, text: str) -> Optional[str]:
+        """Explicit day mentioned in free text: 昨天/前天, 2026-07-06, 7月6日."""
+        today = date.fromisoformat(self.daily_record_service.today())
+        candidate: Optional[date] = None
+        if "前天" in text:
+            candidate = today - timedelta(days=2)
+        elif "昨天" in text:
+            candidate = today - timedelta(days=1)
+        else:
+            match = re.search(r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})[日号]?", text)
+            if match:
+                try:
+                    candidate = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+                except ValueError:
+                    return None
+            else:
+                match = re.search(r"(?<!\d)(\d{1,2})月(\d{1,2})[日号]", text)
+                if match:
+                    try:
+                        candidate = date(today.year, int(match.group(1)), int(match.group(2)))
+                    except ValueError:
+                        return None
+        if candidate is None:
+            return None
+        return self.daily_record_service._validate_backfill_date(candidate.isoformat())
+
     def _parse_date_arg(self, raw: str) -> Optional[str]:
         """Accept '2026-07-29' or '07-29'/'7-29' (current year)."""
         raw = raw.strip().replace("/", "-")
@@ -295,6 +332,14 @@ class TelegramDailyAssistantBot:
         if text == TAB_REVIEW:
             await self.review_command(update, context)
             return
+
+        if text.startswith(TAB_REVIEW):
+            # "回顾7月6日" / "回顾昨天" — jump straight into that day's review.
+            mentioned = self._extract_date_mention(text)
+            if mentioned:
+                self._pending = None
+                await self._begin_review_for(update.effective_chat.id, mentioned)
+                return
 
         if text == TAB_REFLECTION:
             await self.reflection_command(update, context)
@@ -448,14 +493,17 @@ class TelegramDailyAssistantBot:
 
         state_name, state_date = self._parse_state(state)
         if state_name == "awaiting_review":
+            # A day named in the review text itself wins over the state's target.
+            target = self._extract_date_mention(user_input) or state_date
             await self._prepare_pending(
-                update, kind="review", user_input=user_input, source=source, record_date=state_date
+                update, kind="review", user_input=user_input, source=source, record_date=target
             )
             return
 
         if state_name == "awaiting_reflection":
+            target = self._extract_date_mention(user_input) or state_date
             await self._prepare_pending(
-                update, kind="reflection", user_input=user_input, source=source, record_date=state_date
+                update, kind="reflection", user_input=user_input, source=source, record_date=target
             )
             return
 
@@ -483,7 +531,7 @@ class TelegramDailyAssistantBot:
             "source": source,
             "record_date": record_date,
         }
-        date_line = self._backfill_line(parsed) if kind == "task" else ""
+        date_line = self._pending_date_line(kind, parsed, record_date)
         await update.message.reply_text(
             self._format_preview(kind, parsed, date_line),
             reply_markup=CONFIRM_KEYBOARD,
@@ -503,7 +551,9 @@ class TelegramDailyAssistantBot:
             return
 
         self._pending["parsed"] = corrected
-        date_line = self._backfill_line(corrected) if self._pending["kind"] == "task" else ""
+        date_line = self._pending_date_line(
+            self._pending["kind"], corrected, self._pending.get("record_date")
+        )
         await update.message.reply_text(
             "已按你的意见修改：\n\n" + self._format_preview(self._pending["kind"], corrected, date_line),
             reply_markup=CONFIRM_KEYBOARD,
@@ -525,7 +575,7 @@ class TelegramDailyAssistantBot:
             )
 
         if kind == "review":
-            lines = [f"今日完成度：{parsed.get('completion_score', 0)}%"]
+            lines = [f"完成度：{parsed.get('completion_score', 0)}%"]
             if parsed.get("overall_summary"):
                 lines.append(f"总结：{parsed['overall_summary']}")
             completed = parsed.get("completed_tasks", [])
@@ -539,7 +589,7 @@ class TelegramDailyAssistantBot:
             if parsed.get("suggestion_for_tomorrow"):
                 lines.append(f"\n明日建议：{parsed['suggestion_for_tomorrow']}")
             return (
-                "以下回顾将写入 Notion：\n\n"
+                f"以下回顾将写入 Notion：\n{date_line}\n"
                 + "\n".join(lines)
                 + "\n\n确认写入吗？如果有错，直接回复修改意见即可。"
             )
@@ -558,7 +608,7 @@ class TelegramDailyAssistantBot:
         ]
         body = "\n".join(lines) if lines else "（没有解析出内容）"
         return (
-            "以下反思将写入 Notion：\n\n"
+            f"以下反思将写入 Notion：\n{date_line}\n"
             f"{body}\n\n"
             "确认写入吗？如果有错，直接回复修改意见即可。"
         )
