@@ -195,6 +195,26 @@ class TelegramDailyAssistantBot:
             return None
         return self.daily_record_service._validate_backfill_date(candidate.isoformat())
 
+    _DATE_TOKEN_PATTERNS = (
+        r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})[日号]?",
+        r"(?<!\d)(\d{1,2})月(\d{1,2})[日号]",
+        r"前天",
+        r"昨天",
+    )
+
+    def _parse_rewrite_request(self, text: str) -> Optional[tuple[str, str]]:
+        """'重写8月1日：任务A…' -> (date, remaining content); None if not a rewrite."""
+        match = re.match(r"^\s*(重写|重新记录|rewrite|re-?write)\s*[:：,，]?\s*(.*)$", text, re.IGNORECASE | re.DOTALL)
+        if not match:
+            return None
+        rest = match.group(2)
+        target = self._extract_date_mention(rest) or self.daily_record_service.today()
+        for pattern in self._DATE_TOKEN_PATTERNS:
+            rest, hits = re.subn(pattern, "", rest, count=1)
+            if hits:
+                break
+        return target, rest.strip(" :：,，、的")
+
     def _parse_date_arg(self, raw: str) -> Optional[str]:
         """Accept '2026-07-29' or '07-29'/'7-29' (current year)."""
         raw = raw.strip().replace("/", "-")
@@ -487,11 +507,40 @@ class TelegramDailyAssistantBot:
         state = self.state_manager.get_state(self.settings.telegram_user_id)
         await update.message.chat.send_action(action=ChatAction.TYPING)
 
+        rewrite = self._parse_rewrite_request(user_input)
+        if rewrite is not None:
+            target, remainder = rewrite
+            self._pending = None
+            if remainder:
+                await self._prepare_pending(
+                    update, kind="task", user_input=remainder, source=source,
+                    record_date=target, replace=True,
+                )
+                return
+            self.state_manager.set_state(self.settings.telegram_user_id, f"rewriting@{target}")
+            try:
+                existing = await self.daily_record_service.task_count_for(target)
+            except DailyRecordServiceError:
+                existing = 0
+            await update.message.reply_text(
+                f"准备重写{self._date_label(target)}（{target[5:]}）的任务，"
+                f"原有 {existing} 项会被替换。\n\n请发送新的任务清单（文字或语音）。",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+
         if self._pending is not None:
             await self._apply_pending_correction(update, user_input)
             return
 
         state_name, state_date = self._parse_state(state)
+        if state_name == "rewriting":
+            await self._prepare_pending(
+                update, kind="task", user_input=user_input, source=source,
+                record_date=state_date, replace=True,
+            )
+            return
+
         if state_name == "awaiting_review":
             # A day named in the review text itself wins over the state's target.
             target = self._extract_date_mention(user_input) or state_date
@@ -511,7 +560,7 @@ class TelegramDailyAssistantBot:
 
     async def _prepare_pending(
         self, update: Update, kind: str, user_input: str, source: str,
-        record_date: Optional[str] = None,
+        record_date: Optional[str] = None, replace: bool = False,
     ) -> None:
         try:
             if kind == "task":
@@ -530,8 +579,13 @@ class TelegramDailyAssistantBot:
             "raw": user_input,
             "source": source,
             "record_date": record_date,
+            "replace": replace,
         }
-        date_line = self._pending_date_line(kind, parsed, record_date)
+        if replace:
+            target = record_date or self.daily_record_service.today()
+            date_line = f"⚠️ 将清空 {self._date_label(target)}（{target[5:]}）的原有任务，替换为：\n"
+        else:
+            date_line = self._pending_date_line(kind, parsed, record_date)
         await update.message.reply_text(
             self._format_preview(kind, parsed, date_line),
             reply_markup=CONFIRM_KEYBOARD,
@@ -652,19 +706,28 @@ class TelegramDailyAssistantBot:
         try:
             if kind == "task":
                 result = await self.daily_record_service.commit_tasks(
-                    pending["parsed"], pending["raw"], pending["source"]
+                    pending["parsed"], pending["raw"], pending["source"],
+                    record_date=pending.get("record_date"),
+                    replace=bool(pending.get("replace")),
                 )
                 self._pending = None
                 self.state_manager.set_state(self.settings.telegram_user_id, "idle")
                 task_lines = [
                     f"{index}. {task['title']}" for index, task in enumerate(result["tasks"], start=1)
                 ]
-                message = (
-                    "已写入 Notion：\n\n"
-                    + "\n".join(task_lines)
-                    + f"\n\n你{self._date_label(result.get('record_date') or self.daily_record_service.today())}"
-                    + f"一共记录了 {result['task_count']} 个任务。"
-                )
+                saved_label = self._date_label(result.get("record_date") or self.daily_record_service.today())
+                if pending.get("replace"):
+                    message = (
+                        f"已重写{saved_label}的任务（替换了原有 {result.get('replaced_count', 0)} 项）：\n\n"
+                        + "\n".join(task_lines)
+                        + f"\n\n现在{saved_label}共 {result['task_count']} 个任务。"
+                    )
+                else:
+                    message = (
+                        "已写入 Notion：\n\n"
+                        + "\n".join(task_lines)
+                        + f"\n\n你{saved_label}一共记录了 {result['task_count']} 个任务。"
+                    )
             elif kind == "review":
                 review = await self.daily_record_service.commit_review(
                     pending["parsed"], pending["raw"], pending["source"], pending_date

@@ -96,9 +96,21 @@ class DailyRecordService:
             return None
         return candidate.isoformat()
 
-    async def commit_tasks(self, parsed: dict[str, Any], user_input: str, source: str) -> dict[str, Any]:
-        record_date = self._validate_backfill_date(parsed.get("record_date")) or self.today()
+    async def commit_tasks(
+        self, parsed: dict[str, Any], user_input: str, source: str,
+        record_date: Optional[str] = None, replace: bool = False,
+    ) -> dict[str, Any]:
+        record_date = (
+            record_date
+            or self._validate_backfill_date(parsed.get("record_date"))
+            or self.today()
+        )
         payload, page_id = await self._load_or_create_payload(record_date)
+
+        replaced_count = 0
+        if replace:
+            replaced_count = len(payload["tasks"])
+            payload["tasks"] = []
 
         new_tasks = []
         existing_count = len(payload["tasks"])
@@ -133,7 +145,12 @@ class DailyRecordService:
             "tasks": new_tasks,
             "task_count": len(payload["tasks"]),
             "record_date": record_date,
+            "replaced_count": replaced_count,
         }
+
+    async def task_count_for(self, record_date: str) -> int:
+        payload, _ = await self._load_or_create_payload(record_date)
+        return len(payload.get("tasks", []))
 
     async def get_today_tasks(self) -> list[dict[str, Any]]:
         payload = await self.get_or_create_today_payload()
