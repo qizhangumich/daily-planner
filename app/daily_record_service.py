@@ -83,8 +83,21 @@ class DailyRecordService:
         parsed = await self.parse_tasks(user_input)
         return await self.commit_tasks(parsed, user_input, source)
 
+    def _validate_backfill_date(self, value: Any) -> Optional[str]:
+        """Accept an explicit record date if it is real, not future, and not ancient."""
+        if not value:
+            return None
+        try:
+            candidate = date.fromisoformat(str(value)[:10])
+        except ValueError:
+            return None
+        today = date.fromisoformat(self.today())
+        if candidate > today or (today - candidate).days > 60:
+            return None
+        return candidate.isoformat()
+
     async def commit_tasks(self, parsed: dict[str, Any], user_input: str, source: str) -> dict[str, Any]:
-        record_date = self.today()
+        record_date = self._validate_backfill_date(parsed.get("record_date")) or self.today()
         payload, page_id = await self._load_or_create_payload(record_date)
 
         new_tasks = []
@@ -110,7 +123,8 @@ class DailyRecordService:
         payload["sources"] = sorted(set(payload.get("sources", []) + [source]))
         payload["raw_inputs"].append(self._format_raw_input(source, user_input))
         payload["last_updated"] = self.now_iso()
-        payload["review_status"] = "Not Started"
+        if payload.get("review_status") != "Reviewed":  # don't reopen an already-reviewed day
+            payload["review_status"] = "Not Started"
 
         await self._save_payload(record_date, page_id, payload)
 
@@ -118,6 +132,7 @@ class DailyRecordService:
             "summary": parsed.get("summary", "已添加新任务。"),
             "tasks": new_tasks,
             "task_count": len(payload["tasks"]),
+            "record_date": record_date,
         }
 
     async def get_today_tasks(self) -> list[dict[str, Any]]:
@@ -181,6 +196,18 @@ class DailyRecordService:
             if has_tasks and not reviewed:
                 return record_date
         return None
+
+    async def reviewable_dates(self, limit: int = 5, lookback_days: int = 60) -> list[tuple[str, int]]:
+        """Newest-first days that have tasks but no review yet, with task counts."""
+        results: list[tuple[str, int]] = []
+        for record_date, has_tasks, reviewed, _ in await self._recent_day_states(lookback_days):
+            if not (has_tasks and not reviewed):
+                continue
+            cached = self.storage.get_daily_payload(record_date)
+            results.append((record_date, len((cached or {}).get("tasks", []))))
+            if len(results) >= limit:
+                break
+        return results
 
     async def latest_reflectable_date(self, lookback_days: int = 60) -> Optional[str]:
         """Most recent reviewed day that has no reflection yet."""

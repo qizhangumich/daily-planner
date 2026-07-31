@@ -127,6 +127,7 @@ class TelegramDailyAssistantBot:
         application.add_handler(CommandHandler("weekly", self.weekly_command))
         application.add_handler(CommandHandler("names", self.names_command))
         application.add_handler(CallbackQueryHandler(self.pending_callback, pattern=r"^pending:"))
+        application.add_handler(CallbackQueryHandler(self.review_date_callback, pattern=r"^rvd:"))
         application.add_handler(MessageHandler(filters.VOICE, self.voice_message_handler))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_message_handler))
         application.add_error_handler(self.error_handler)
@@ -150,6 +151,25 @@ class TelegramDailyAssistantBot:
             name, iso = state.split("@", 1)
             return name, iso
         return state, None
+
+    def _backfill_line(self, parsed: dict) -> str:
+        target = self.daily_record_service._validate_backfill_date(parsed.get("record_date"))
+        if target and target != self.daily_record_service.today():
+            return f"📅 将记录到：{int(target[5:7])}月{int(target[8:10])}日（{self._date_label(target)}）\n"
+        return ""
+
+    def _parse_date_arg(self, raw: str) -> Optional[str]:
+        """Accept '2026-07-29' or '07-29'/'7-29' (current year)."""
+        raw = raw.strip().replace("/", "-")
+        if raw.count("-") == 1:
+            today = self.daily_record_service.today()
+            raw = f"{today[:4]}-{raw}"
+        try:
+            parts = raw.split("-")
+            normalized = f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+        except (ValueError, IndexError):
+            return None
+        return self.daily_record_service._validate_backfill_date(normalized)
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
@@ -199,7 +219,18 @@ class TelegramDailyAssistantBot:
     async def review_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
             return
-        await self._send_review_prompt(chat_id=update.effective_chat.id)
+        args = context.args or []
+        if args:
+            target = self._parse_date_arg(args[0])
+            if target is None:
+                await update.message.reply_text(
+                    "日期格式不对，示例：/review 07-29 或 /review 2026-07-29",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+                return
+            await self._begin_review_for(update.effective_chat.id, target)
+            return
+        await self._send_review_prompt(chat_id=update.effective_chat.id, allow_picker=True)
 
     async def reflection_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
@@ -326,15 +357,55 @@ class TelegramDailyAssistantBot:
             raise RuntimeError("Telegram application has not been initialized.")
         await self._send_review_prompt(chat_id=self.settings.telegram_user_id)
 
-    async def _send_review_prompt(self, chat_id: int) -> None:
+    async def _send_review_prompt(self, chat_id: int, allow_picker: bool = False) -> None:
         if self.application is None:
             raise RuntimeError("Telegram application has not been initialized.")
 
+        if allow_picker:
+            try:
+                candidates = await self.daily_record_service.reviewable_dates()
+            except DailyRecordServiceError:
+                candidates = []
+            if len(candidates) >= 2:
+                today = self.daily_record_service.today()
+                buttons = [
+                    [InlineKeyboardButton(
+                        f"{record_date[5:]}（{self._date_label(record_date)}）· {count} 项",
+                        callback_data=f"rvd:{record_date}",
+                    )]
+                    for record_date, count in candidates
+                ]
+                if all(record_date != today for record_date, _ in candidates):
+                    buttons.append([InlineKeyboardButton("今天（自由回顾）", callback_data=f"rvd:{today}")])
+                await self.application.bot.send_message(
+                    chat_id=chat_id,
+                    text="有几天的任务还没有回顾，选择要回顾的日期：",
+                    reply_markup=InlineKeyboardMarkup(buttons),
+                )
+                return
+
+        target = (
+            await self.daily_record_service.latest_reviewable_date()
+            or self.daily_record_service.today()
+        )
+        await self._begin_review_for(chat_id, target)
+
+    async def review_date_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if query is None or query.from_user is None or query.from_user.id != self.settings.telegram_user_id:
+            return
+        await query.answer()
+        target = self._parse_date_arg(query.data.split(":", 1)[1])
+        if target is None:
+            await query.edit_message_text("这个日期已经不能回顾了，请重新点“回顾”。")
+            return
+        await query.edit_message_text(f"回顾 {self._date_label(target)}（{target[5:]}）：")
+        await self._begin_review_for(query.message.chat_id, target)
+
+    async def _begin_review_for(self, chat_id: int, target: str) -> None:
+        if self.application is None:
+            raise RuntimeError("Telegram application has not been initialized.")
         try:
-            target = (
-                await self.daily_record_service.latest_reviewable_date()
-                or self.daily_record_service.today()
-            )
             payload = await self.daily_record_service.prepare_evening_review(target)
         except DailyRecordServiceError as exc:
             await self.application.bot.send_message(
@@ -412,8 +483,9 @@ class TelegramDailyAssistantBot:
             "source": source,
             "record_date": record_date,
         }
+        date_line = self._backfill_line(parsed) if kind == "task" else ""
         await update.message.reply_text(
-            self._format_preview(kind, parsed),
+            self._format_preview(kind, parsed, date_line),
             reply_markup=CONFIRM_KEYBOARD,
         )
 
@@ -431,13 +503,14 @@ class TelegramDailyAssistantBot:
             return
 
         self._pending["parsed"] = corrected
+        date_line = self._backfill_line(corrected) if self._pending["kind"] == "task" else ""
         await update.message.reply_text(
-            "已按你的意见修改：\n\n" + self._format_preview(self._pending["kind"], corrected),
+            "已按你的意见修改：\n\n" + self._format_preview(self._pending["kind"], corrected, date_line),
             reply_markup=CONFIRM_KEYBOARD,
         )
 
     @staticmethod
-    def _format_preview(kind: str, parsed: dict) -> str:
+    def _format_preview(kind: str, parsed: dict, date_line: str = "") -> str:
         if kind == "task":
             tasks = parsed.get("tasks", [])
             lines = [
@@ -446,7 +519,7 @@ class TelegramDailyAssistantBot:
             ]
             body = "\n".join(lines) if lines else "（没有解析出任务）"
             return (
-                "以下任务将写入 Notion：\n\n"
+                f"以下任务将写入 Notion：\n{date_line}\n"
                 f"{body}\n\n"
                 "确认写入吗？如果有错（比如公司名），直接回复修改意见即可。"
             )
@@ -539,7 +612,8 @@ class TelegramDailyAssistantBot:
                 message = (
                     "已写入 Notion：\n\n"
                     + "\n".join(task_lines)
-                    + f"\n\n你今天目前一共记录了 {result['task_count']} 个任务。"
+                    + f"\n\n你{self._date_label(result.get('record_date') or self.daily_record_service.today())}"
+                    + f"一共记录了 {result['task_count']} 个任务。"
                 )
             elif kind == "review":
                 review = await self.daily_record_service.commit_review(
