@@ -316,6 +316,17 @@ class DailyRecordService:
 
         notion_record = await self.notion_client.find_record_by_date(record_date)
         if notion_record:
+            # Notion's date filter can match neighboring days across timezones —
+            # never adopt a page whose actual Date differs from what we asked for.
+            actual = (
+                (notion_record.get("properties", {}).get("Date", {}).get("date") or {}).get("start") or ""
+            )[:10]
+            if actual != record_date:
+                logger.warning(
+                    "Notion returned page dated %s for query %s; ignoring it.", actual, record_date
+                )
+                notion_record = None
+        if notion_record:
             page_id = notion_record["id"]
             if await self._page_is_active(page_id):
                 payload = await self.notion_client.get_payload_from_page(page_id)
