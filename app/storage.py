@@ -43,6 +43,12 @@ class Storage:
                     term TEXT PRIMARY KEY,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS weekly_goals (
+                    week_start TEXT PRIMARY KEY,
+                    goals_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -109,6 +115,27 @@ class Storage:
                 "DELETE FROM daily_cache WHERE record_date = ?",
                 (record_date,),
             )
+
+    def save_weekly_goals(self, week_start: str, goals: list[str]) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO weekly_goals (week_start, goals_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(week_start) DO UPDATE SET
+                    goals_json=excluded.goals_json,
+                    updated_at=excluded.updated_at
+                """,
+                (week_start, json.dumps(goals, ensure_ascii=False), self._now()),
+            )
+
+    def get_weekly_goals(self, week_start: str) -> list[str]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT goals_json FROM weekly_goals WHERE week_start = ?",
+                (week_start,),
+            ).fetchone()
+        return json.loads(row["goals_json"]) if row else []
 
     def add_glossary_term(self, term: str) -> None:
         with self._lock, self._connection:

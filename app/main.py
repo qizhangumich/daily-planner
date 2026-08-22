@@ -70,6 +70,7 @@ def main() -> None:
 
     async def post_init(app) -> None:
         scheduler.start(bot.send_evening_review_reminder)
+        await bot.register_command_menu()
 
     async def post_shutdown(app) -> None:
         scheduler.shutdown()

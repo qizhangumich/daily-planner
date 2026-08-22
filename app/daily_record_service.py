@@ -79,6 +79,31 @@ class DailyRecordService:
             logger.exception("Applying correction failed")
             raise DailyRecordServiceError(f"Failed to apply correction: {exc}") from exc
 
+    def current_week_start(self) -> str:
+        today = date.fromisoformat(self.today())
+        return (today - timedelta(days=today.weekday())).isoformat()
+
+    def get_week_goals(self, week_start: Optional[str] = None) -> list[str]:
+        return self.storage.get_weekly_goals(week_start or self.current_week_start())
+
+    async def parse_goals(self, user_input: str) -> dict[str, Any]:
+        if self.openai_client is None or self.prompts_dir is None:
+            raise DailyRecordServiceError("Goals support is not configured.")
+        template = (self.prompts_dir / "parse_goals.md").read_text(encoding="utf-8")
+        current = self.get_week_goals()
+        current_text = "\n".join(f"- {goal}" for goal in current) if current else "（无）"
+        prompt = template.replace("{{current_goals}}", current_text).replace("{{user_input}}", user_input)
+        try:
+            return await self.openai_client.generate_json(prompt)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Goals parsing failed")
+            raise DailyRecordServiceError(f"Failed to parse goals: {exc}") from exc
+
+    def commit_goals(self, goals: list[str]) -> list[str]:
+        cleaned = [str(goal).strip() for goal in goals if str(goal).strip()][:6]
+        self.storage.save_weekly_goals(self.current_week_start(), cleaned)
+        return cleaned
+
     async def add_task_to_today(self, user_input: str, source: str) -> dict[str, Any]:
         parsed = await self.parse_tasks(user_input)
         return await self.commit_tasks(parsed, user_input, source)

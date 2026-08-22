@@ -48,11 +48,12 @@ HELP_TEXT = """欢迎使用每日记录助手。
 - 反思：记录今天的感受、收获和改进点
 - 周报：生成上一周（周一到周日）的 PDF 周报
 
-也可以继续使用这些命令：
+也可以继续使用这些命令（输入 / 会弹出命令菜单）：
 /start - 显示欢迎信息
+/goals - 设定/查看本周目标（周报会逐条评估完成情况）
 /add - 添加今天的任务记录
 /today - 查看今天已记录的任务
-/review - 手动开始当天回顾
+/review - 手动开始当天回顾（可指定日期：/review 07-29）
 /reflection - 手动开始今天反思
 /weekly - 生成上一周的 PDF 周报
 /names - 管理专有名词表（公司/人名/项目）
@@ -126,6 +127,7 @@ class TelegramDailyAssistantBot:
         application.add_handler(CommandHandler("review", self.review_command))
         application.add_handler(CommandHandler("reflection", self.reflection_command))
         application.add_handler(CommandHandler("weekly", self.weekly_command))
+        application.add_handler(CommandHandler("goals", self.goals_command))
         application.add_handler(CommandHandler("names", self.names_command))
         application.add_handler(CallbackQueryHandler(self.pending_callback, pattern=r"^pending:"))
         application.add_handler(CallbackQueryHandler(self.review_date_callback, pattern=r"^rvd:"))
@@ -134,6 +136,22 @@ class TelegramDailyAssistantBot:
         application.add_error_handler(self.error_handler)
         self.application = application
         return application
+
+    async def register_command_menu(self) -> None:
+        """Populate Telegram's '/' command menu."""
+        from telegram import BotCommand
+
+        if self.application is None:
+            return
+        await self.application.bot.set_my_commands([
+            BotCommand("goals", "设定/查看本周目标"),
+            BotCommand("today", "查看今天的任务"),
+            BotCommand("review", "回顾（可加日期：/review 07-29）"),
+            BotCommand("reflection", "写今天的反思"),
+            BotCommand("weekly", "生成上一周的 PDF 周报"),
+            BotCommand("names", "管理专有名词表"),
+            BotCommand("help", "帮助"),
+        ])
 
     def _date_label(self, record_date: str) -> str:
         delta = (date.fromisoformat(self.daily_record_service.today()) - date.fromisoformat(record_date)).days
@@ -288,6 +306,24 @@ class TelegramDailyAssistantBot:
             await self._begin_review_for(update.effective_chat.id, target)
             return
         await self._send_review_prompt(chat_id=update.effective_chat.id, allow_picker=True)
+
+    async def goals_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._is_authorized(update):
+            return
+        self._pending = None
+        week_start = self.daily_record_service.current_week_start()
+        goals = self.daily_record_service.get_week_goals(week_start)
+        listing = (
+            "\n".join(f"{index}. {goal}" for index, goal in enumerate(goals, start=1))
+            if goals else "（还没有设定本周目标）"
+        )
+        self.state_manager.set_state(self.settings.telegram_user_id, "setting_goals")
+        await update.message.reply_text(
+            f"🎯 本周目标（{week_start[5:]} 起）：\n\n{listing}\n\n"
+            "直接回复即可设定或调整：说出完整清单会替换，说“再加一个…”会补充，"
+            "说“去掉…”会删除。周报会逐条评估这些目标的完成情况。",
+            reply_markup=MAIN_KEYBOARD,
+        )
 
     async def reflection_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
@@ -534,6 +570,10 @@ class TelegramDailyAssistantBot:
             return
 
         state_name, state_date = self._parse_state(state)
+        if state_name == "setting_goals":
+            await self._prepare_pending(update, kind="goals", user_input=user_input, source=source)
+            return
+
         if state_name == "rewriting":
             await self._prepare_pending(
                 update, kind="task", user_input=user_input, source=source,
@@ -567,6 +607,8 @@ class TelegramDailyAssistantBot:
                 parsed = await self.daily_record_service.parse_tasks(user_input)
             elif kind == "review":
                 parsed = await self.daily_record_service.parse_review(user_input, record_date)
+            elif kind == "goals":
+                parsed = await self.daily_record_service.parse_goals(user_input)
             else:
                 parsed = await self.daily_record_service.parse_reflection(user_input, record_date)
         except DailyRecordServiceError as exc:
@@ -615,6 +657,16 @@ class TelegramDailyAssistantBot:
 
     @staticmethod
     def _format_preview(kind: str, parsed: dict, date_line: str = "") -> str:
+        if kind == "goals":
+            goals = parsed.get("goals", [])
+            lines = [f"{index}. {goal}" for index, goal in enumerate(goals, start=1)]
+            body = "\n".join(lines) if lines else "（没有解析出目标）"
+            return (
+                "🎯 本周目标将保存为：\n\n"
+                f"{body}\n\n"
+                "确认吗？如果有错，直接回复修改意见即可。"
+            )
+
         if kind == "task":
             tasks = parsed.get("tasks", [])
             lines = [
@@ -687,8 +739,12 @@ class TelegramDailyAssistantBot:
 
         if action == "cancel":
             self._pending = None
-            restore = {"review": "awaiting_review", "reflection": "awaiting_reflection"}.get(kind, "idle")
-            if restore != "idle" and pending_date:
+            restore = {
+                "review": "awaiting_review",
+                "reflection": "awaiting_reflection",
+                "goals": "setting_goals",
+            }.get(kind, "idle")
+            if restore in {"awaiting_review", "awaiting_reflection"} and pending_date:
                 restore = f"{restore}@{pending_date}"
             self.state_manager.set_state(self.settings.telegram_user_id, restore)
             await query.edit_message_text("已取消，这条记录没有写入 Notion。可以重新发送内容。")
@@ -728,6 +784,16 @@ class TelegramDailyAssistantBot:
                         + "\n".join(task_lines)
                         + f"\n\n你{saved_label}一共记录了 {result['task_count']} 个任务。"
                     )
+            elif kind == "goals":
+                goals = self.daily_record_service.commit_goals(pending["parsed"].get("goals", []))
+                self._pending = None
+                self.state_manager.set_state(self.settings.telegram_user_id, "idle")
+                listing = "\n".join(f"{index}. {goal}" for index, goal in enumerate(goals, start=1))
+                message = (
+                    "🎯 本周目标已保存：\n\n"
+                    f"{listing}\n\n"
+                    "周报会逐条评估完成情况。随时用 /goals 查看或调整。"
+                )
             elif kind == "review":
                 review = await self.daily_record_service.commit_review(
                     pending["parsed"], pending["raw"], pending["source"], pending_date

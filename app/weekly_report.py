@@ -83,10 +83,11 @@ class WeeklyReportService:
         week_start, week_end = last_completed_week(today)
 
         days = await self._collect_week_data(week_start, week_end)
-        ai_summary = await self._generate_ai_summary(days)
+        week_goals = self.storage.get_weekly_goals(week_start.isoformat())
+        ai_summary = await self._generate_ai_summary(days, week_goals)
 
         output_path = self.data_dir / f"weekly_report_{week_start.isoformat()}_{week_end.isoformat()}.pdf"
-        self._render_pdf(days, week_start, week_end, ai_summary, output_path)
+        self._render_pdf(days, week_start, week_end, ai_summary, output_path, week_goals)
         return output_path, week_start, week_end
 
     async def _collect_week_data(self, week_start: date, week_end: date) -> list[DayData]:
@@ -154,10 +155,11 @@ class WeeklyReportService:
         day.fallback_text = text_of("Daily Summary")
         day.has_record = bool(day.tasks or day.fallback_text)
 
-    async def _generate_ai_summary(self, days: list[DayData]) -> dict[str, Any]:
+    async def _generate_ai_summary(self, days: list[DayData], week_goals: list[str] | None = None) -> dict[str, Any]:
         recorded = [day for day in days if day.has_record]
         if not recorded:
             return {}
+        week_goals = week_goals or []
 
         lines: list[str] = []
         for day in recorded:
@@ -179,7 +181,12 @@ class WeeklyReportService:
 
         try:
             prompt_template = (self.prompts_dir / "weekly_summary.md").read_text(encoding="utf-8")
-            prompt = prompt_template.replace("{{week_data}}", "\n".join(lines))
+            goals_text = "\n".join(f"- {goal}" for goal in week_goals) if week_goals else "（无）"
+            prompt = (
+                prompt_template
+                .replace("{{week_goals}}", goals_text)
+                .replace("{{week_data}}", "\n".join(lines))
+            )
             return await self.openai_client.generate_json(prompt)
         except (OpenAIClientError, OSError):
             logger.warning("Weekly AI summary generation failed; the report will omit it.")
@@ -192,10 +199,11 @@ class WeeklyReportService:
         week_end: date,
         ai_summary: dict[str, Any],
         output_path: Path,
+        week_goals: list[str] | None = None,
     ) -> None:
         from weasyprint import HTML  # imported lazily: heavy native deps
 
-        document = build_report_html(days, week_start, week_end, ai_summary, self.timezone)
+        document = build_report_html(days, week_start, week_end, ai_summary, self.timezone, week_goals)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         HTML(string=document).write_pdf(str(output_path))
 
@@ -284,12 +292,49 @@ def _render_day_card(day: DayData) -> str:
     </section>"""
 
 
+GOAL_STATUS_STYLES = {
+    "done": ("✅ 已完成", "#16a34a"),
+    "partial": ("🔶 有进展", "#d97706"),
+    "not_done": ("❌ 未完成", "#dc2626"),
+}
+
+
+def render_goals_section(week_goals: list[str], ai_summary: dict[str, Any]) -> str:
+    """本周目标 section: AI assessment when available, plain list otherwise."""
+    if not week_goals:
+        return ""
+    assessments = {
+        str(item.get("goal", "")): item
+        for item in (ai_summary.get("goals_assessment") or [])
+        if isinstance(item, dict)
+    }
+    rows = []
+    for goal in week_goals:
+        item = assessments.get(goal) or next(
+            (a for key, a in assessments.items() if key and (key in goal or goal in key)), None
+        )
+        status = (item or {}).get("status", "")
+        label, color = GOAL_STATUS_STYLES.get(status, ("▫️ 未评估", "#6b7280"))
+        evidence = _esc((item or {}).get("evidence", ""))
+        evidence_html = f'<div class="goal-evidence">{evidence}</div>' if evidence else ""
+        rows.append(
+            f'<div class="goal-row"><span class="goal-status" style="color:{color}">{label}</span>'
+            f'<div class="goal-body"><div class="goal-title">{_esc(goal)}</div>{evidence_html}</div></div>'
+        )
+    return f"""
+    <section class="goals">
+      <h3>🎯 本周目标</h3>
+      {''.join(rows)}
+    </section>"""
+
+
 def build_report_html(
     days: list[DayData],
     week_start: date,
     week_end: date,
     ai_summary: dict[str, Any],
     timezone: ZoneInfo,
+    week_goals: list[str] | None = None,
 ) -> str:
     recorded_days = [day for day in days if day.has_record]
     scores = [day.completion_score for day in recorded_days if day.completion_score is not None]
@@ -373,6 +418,15 @@ def build_report_html(
   .stat-value {{ font-size: 17pt; font-weight: 700; color: #4f46e5; }}
   .stat-value small {{ font-size: 9pt; font-weight: 400; color: #818cf8; }}
   .stat-label {{ font-size: 8.5pt; color: #6b7280; margin-top: 1mm; }}
+  .goals {{
+    background: #f5f6ff; border: 1px solid #e0e3f8;
+    border-radius: 10px; padding: 5mm 6mm; margin-bottom: 7mm;
+  }}
+  .goals h3 {{ font-size: 10.5pt; color: #312e81; margin-bottom: 3mm; }}
+  .goal-row {{ display: flex; gap: 4mm; align-items: flex-start; padding: 1.5mm 0; }}
+  .goal-status {{ flex: none; font-size: 9pt; font-weight: 700; width: 22mm; }}
+  .goal-title {{ font-size: 10pt; color: #111827; }}
+  .goal-evidence {{ font-size: 8.5pt; color: #6b7280; margin-top: 0.5mm; }}
   .summary {{
     background: #fafaff; border-left: 3px solid #4f46e5;
     border-radius: 0 10px 10px 0; padding: 5mm 6mm; margin-bottom: 8mm;
@@ -434,6 +488,7 @@ def build_report_html(
   </div>
   <div class="content">
     <div class="stats">{stats_html}</div>
+    {render_goals_section(week_goals or [], ai_summary)}
     {summary_html}
     {days_html}
   </div>
