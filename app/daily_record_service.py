@@ -101,7 +101,7 @@ class DailyRecordService:
             raise DailyRecordServiceError(f"Failed to parse goals: {exc}") from exc
 
     def commit_goals(self, goals: list[str]) -> list[str]:
-        cleaned = [str(goal).strip() for goal in goals if str(goal).strip()][:6]
+        cleaned = [str(goal).strip() for goal in goals if str(goal).strip()][:10]
         self.storage.save_weekly_goals(self.current_week_start(), cleaned)
         return cleaned
 
