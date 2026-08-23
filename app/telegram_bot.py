@@ -51,7 +51,7 @@ HELP_TEXT = """欢迎使用每日记录助手。
 也可以继续使用这些命令（输入 / 会弹出命令菜单）：
 /start - 显示欢迎信息
 /goals - 设定/查看本周目标（周报会逐条评估完成情况）
-/add - 添加今天的任务记录
+/add - 添加任务记录（可补记：/add 08-22 内容）
 /today - 查看今天已记录的任务
 /review - 手动开始当天回顾（可指定日期：/review 07-29）
 /reflection - 手动开始今天反思
@@ -145,8 +145,9 @@ class TelegramDailyAssistantBot:
             return
         await self.application.bot.set_my_commands([
             BotCommand("goals", "设定/查看本周目标"),
+            BotCommand("add", "补记任务（/add 08-22 内容）"),
             BotCommand("today", "查看今天的任务"),
-            BotCommand("review", "回顾（可加日期：/review 07-29）"),
+            BotCommand("review", "回顾（可加日期：/review 08-22）"),
             BotCommand("reflection", "写今天的反思"),
             BotCommand("weekly", "生成上一周的 PDF 周报"),
             BotCommand("names", "管理专有名词表"),
@@ -179,6 +180,11 @@ class TelegramDailyAssistantBot:
 
     def _pending_date_line(self, kind: str, parsed: dict, record_date: Optional[str]) -> str:
         if kind == "task":
+            if record_date and record_date != self.daily_record_service.today():
+                return (
+                    f"📅 将记录到：{int(record_date[5:7])}月{int(record_date[8:10])}日"
+                    f"（{self._date_label(record_date)}）\n"
+                )
             return self._backfill_line(parsed)
         if record_date and record_date != self.daily_record_service.today():
             return (
@@ -259,6 +265,29 @@ class TelegramDailyAssistantBot:
 
     async def add_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
+            return
+        args = context.args or []
+        if args:
+            target = self._parse_date_arg(args[0])
+            if target is None:
+                await update.message.reply_text(
+                    "日期格式不对，示例：/add 08-22 或 /add 2026-08-22（可以只给日期，也可以带上内容）",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+                return
+            content = " ".join(args[1:]).strip()
+            self._pending = None
+            if content:
+                await self._prepare_pending(
+                    update, kind="task", user_input=content,
+                    source="Telegram Text", record_date=target,
+                )
+                return
+            self.state_manager.set_state(self.settings.telegram_user_id, f"adding_task@{target}")
+            await update.message.reply_text(
+                f"补记{self._date_label(target)}（{target[5:]}）的任务，请发送内容（文字或语音）。",
+                reply_markup=MAIN_KEYBOARD,
+            )
             return
         self.state_manager.set_state(self.settings.telegram_user_id, "adding_task")
         await update.message.reply_text(
@@ -570,6 +599,12 @@ class TelegramDailyAssistantBot:
             return
 
         state_name, state_date = self._parse_state(state)
+        if state_name == "adding_task" and state_date:
+            await self._prepare_pending(
+                update, kind="task", user_input=user_input, source=source, record_date=state_date
+            )
+            return
+
         if state_name == "setting_goals":
             await self._prepare_pending(update, kind="goals", user_input=user_input, source=source)
             return
