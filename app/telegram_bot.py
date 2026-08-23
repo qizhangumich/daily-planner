@@ -46,7 +46,7 @@ HELP_TEXT = """欢迎使用每日记录助手。
 - 记录：记录今天早上的安排、任务或计划
 - 回顾：记录当天的完成情况
 - 反思：记录今天的感受、收获和改进点
-- 周报：生成上一周（周一到周日）的 PDF 周报
+- 周报：生成上一周（周日到周六）的 PDF 周报
 
 也可以继续使用这些命令（输入 / 会弹出命令菜单）：
 /start - 显示欢迎信息
@@ -341,6 +341,7 @@ class TelegramDailyAssistantBot:
             return
         self._pending = None
         week_start = self.daily_record_service.current_week_start()
+        week_end = (date.fromisoformat(week_start) + timedelta(days=6)).isoformat()
         goals = self.daily_record_service.get_week_goals(week_start)
         listing = (
             "\n".join(f"{index}. {goal}" for index, goal in enumerate(goals, start=1))
@@ -348,7 +349,7 @@ class TelegramDailyAssistantBot:
         )
         self.state_manager.set_state(self.settings.telegram_user_id, "setting_goals")
         await update.message.reply_text(
-            f"🎯 本周目标（{week_start[5:]} 起）：\n\n{listing}\n\n"
+            f"🎯 本周目标（{week_start[5:]} 周日 至 {week_end[5:]} 周六，每周日自动开启新的一周）：\n\n{listing}\n\n"
             "直接回复即可设定或调整：说出完整清单会替换，说“再加一个…”会补充，"
             "说“去掉…”会删除。周报会逐条评估这些目标的完成情况。",
             reply_markup=MAIN_KEYBOARD,

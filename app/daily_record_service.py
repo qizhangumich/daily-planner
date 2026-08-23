@@ -80,8 +80,9 @@ class DailyRecordService:
             raise DailyRecordServiceError(f"Failed to apply correction: {exc}") from exc
 
     def current_week_start(self) -> str:
+        """Weeks run Sunday through Saturday; returns the most recent Sunday."""
         today = date.fromisoformat(self.today())
-        return (today - timedelta(days=today.weekday())).isoformat()
+        return (today - timedelta(days=(today.weekday() + 1) % 7)).isoformat()
 
     def get_week_goals(self, week_start: Optional[str] = None) -> list[str]:
         return self.storage.get_weekly_goals(week_start or self.current_week_start())

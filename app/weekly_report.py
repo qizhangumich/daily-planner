@@ -50,14 +50,15 @@ class DayData:
 
 
 def last_completed_week(today: date) -> tuple[date, date]:
-    """Return (monday, sunday) of the most recent completed week.
+    """Return (sunday, saturday) of the most recent completed week.
 
-    Asking on any weekday returns the week that ended on the most recent
-    Sunday; asking on a Sunday treats today as that week's end.
+    Weeks run Sunday through Saturday. Asking on any day returns the week
+    that ended on the most recent Saturday; asking on a Saturday treats
+    today as that week's end.
     """
-    days_since_sunday = (today.weekday() + 1) % 7
-    end_sunday = today - timedelta(days=days_since_sunday)
-    return end_sunday - timedelta(days=6), end_sunday
+    days_since_saturday = (today.weekday() - 5) % 7
+    end_saturday = today - timedelta(days=days_since_saturday)
+    return end_saturday - timedelta(days=6), end_saturday
 
 
 class WeeklyReportService:
