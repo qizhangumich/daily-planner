@@ -109,8 +109,9 @@ class DailyRecordService:
         parsed = await self.parse_tasks(user_input)
         return await self.commit_tasks(parsed, user_input, source)
 
-    def _validate_backfill_date(self, value: Any) -> Optional[str]:
-        """Accept an explicit record date if it is real, not future, and not ancient."""
+    def _validate_backfill_date(self, value: Any, allow_future: bool = False) -> Optional[str]:
+        """Accept an explicit record date: up to 60 days back, and (for task
+        planning) up to 30 days ahead when allow_future is set."""
         if not value:
             return None
         try:
@@ -118,7 +119,8 @@ class DailyRecordService:
         except ValueError:
             return None
         today = date.fromisoformat(self.today())
-        if candidate > today or (today - candidate).days > 60:
+        future_limit = 30 if allow_future else 0
+        if (candidate - today).days > future_limit or (today - candidate).days > 60:
             return None
         return candidate.isoformat()
 
@@ -128,7 +130,7 @@ class DailyRecordService:
     ) -> dict[str, Any]:
         record_date = (
             record_date
-            or self._validate_backfill_date(parsed.get("record_date"))
+            or self._validate_backfill_date(parsed.get("record_date"), allow_future=True)
             or self.today()
         )
         payload, page_id = await self._load_or_create_payload(record_date)

@@ -51,7 +51,7 @@ HELP_TEXT = """欢迎使用每日记录助手。
 也可以继续使用这些命令（输入 / 会弹出命令菜单）：
 /start - 显示欢迎信息
 /goals - 设定/查看本周目标（周报会逐条评估完成情况）
-/add - 添加任务记录（可补记：/add 08-22 内容）
+/add - 添加任务记录（可补记或提前计划：/add 明天 内容、/add 09-07 内容）
 /today - 查看今天已记录的任务
 /review - 手动开始当天回顾（可指定日期：/review 07-29）
 /reflection - 手动开始今天反思
@@ -145,7 +145,7 @@ class TelegramDailyAssistantBot:
             return
         await self.application.bot.set_my_commands([
             BotCommand("goals", "设定/查看本周目标"),
-            BotCommand("add", "补记任务（/add 08-22 内容）"),
+            BotCommand("add", "补记或提前计划（/add 明天 内容）"),
             BotCommand("today", "查看今天的任务"),
             BotCommand("review", "回顾（可加日期：/review 08-22）"),
             BotCommand("reflection", "写今天的反思"),
@@ -156,6 +156,12 @@ class TelegramDailyAssistantBot:
 
     def _date_label(self, record_date: str) -> str:
         delta = (date.fromisoformat(self.daily_record_service.today()) - date.fromisoformat(record_date)).days
+        if delta == -1:
+            return "明天"
+        if delta == -2:
+            return "后天"
+        if delta < -2:
+            return f"{int(record_date[5:7])}月{int(record_date[8:10])}日"
         if delta == 0:
             return "今天"
         if delta == 1:
@@ -173,7 +179,7 @@ class TelegramDailyAssistantBot:
         return state, None
 
     def _backfill_line(self, parsed: dict) -> str:
-        target = self.daily_record_service._validate_backfill_date(parsed.get("record_date"))
+        target = self.daily_record_service._validate_backfill_date(parsed.get("record_date"), allow_future=True)
         if target and target != self.daily_record_service.today():
             return f"📅 将记录到：{int(target[5:7])}月{int(target[8:10])}日（{self._date_label(target)}）\n"
         return ""
@@ -193,11 +199,15 @@ class TelegramDailyAssistantBot:
             )
         return ""
 
-    def _extract_date_mention(self, text: str) -> Optional[str]:
-        """Explicit day mentioned in free text: 昨天/前天, 2026-07-06, 7月6日."""
+    def _extract_date_mention(self, text: str, allow_future: bool = False) -> Optional[str]:
+        """Explicit day mentioned in free text: 昨天/前天, 明天/后天 (planning), 2026-07-06, 7月6日."""
         today = date.fromisoformat(self.daily_record_service.today())
         candidate: Optional[date] = None
-        if "前天" in text:
+        if allow_future and "后天" in text:
+            candidate = today + timedelta(days=2)
+        elif allow_future and "明天" in text:
+            candidate = today + timedelta(days=1)
+        elif "前天" in text:
             candidate = today - timedelta(days=2)
         elif "昨天" in text:
             candidate = today - timedelta(days=1)
@@ -217,13 +227,15 @@ class TelegramDailyAssistantBot:
                         return None
         if candidate is None:
             return None
-        return self.daily_record_service._validate_backfill_date(candidate.isoformat())
+        return self.daily_record_service._validate_backfill_date(candidate.isoformat(), allow_future)
 
     _DATE_TOKEN_PATTERNS = (
         r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})[日号]?",
         r"(?<!\d)(\d{1,2})月(\d{1,2})[日号]",
         r"前天",
         r"昨天",
+        r"明天",
+        r"后天",
     )
 
     def _parse_rewrite_request(self, text: str) -> Optional[tuple[str, str]]:
@@ -232,25 +244,30 @@ class TelegramDailyAssistantBot:
         if not match:
             return None
         rest = match.group(2)
-        target = self._extract_date_mention(rest) or self.daily_record_service.today()
+        target = self._extract_date_mention(rest, allow_future=True) or self.daily_record_service.today()
         for pattern in self._DATE_TOKEN_PATTERNS:
             rest, hits = re.subn(pattern, "", rest, count=1)
             if hits:
                 break
         return target, rest.strip(" :：,，、的")
 
-    def _parse_date_arg(self, raw: str) -> Optional[str]:
-        """Accept '2026-07-29' or '07-29'/'7-29' (current year)."""
+    def _parse_date_arg(self, raw: str, allow_future: bool = False) -> Optional[str]:
+        """Accept '2026-07-29', '07-29'/'7-29' (current year), or 今天/昨天/前天/明天/后天."""
         raw = raw.strip().replace("/", "-")
+        words = {"今天": 0, "昨天": -1, "前天": -2, "明天": 1, "后天": 2}
+        if raw in words:
+            today = date.fromisoformat(self.daily_record_service.today())
+            normalized = (today + timedelta(days=words[raw])).isoformat()
+            return self.daily_record_service._validate_backfill_date(normalized, allow_future)
         if raw.count("-") == 1:
-            today = self.daily_record_service.today()
-            raw = f"{today[:4]}-{raw}"
+            today_iso = self.daily_record_service.today()
+            raw = f"{today_iso[:4]}-{raw}"
         try:
             parts = raw.split("-")
             normalized = f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
         except (ValueError, IndexError):
             return None
-        return self.daily_record_service._validate_backfill_date(normalized)
+        return self.daily_record_service._validate_backfill_date(normalized, allow_future)
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
@@ -268,10 +285,11 @@ class TelegramDailyAssistantBot:
             return
         args = context.args or []
         if args:
-            target = self._parse_date_arg(args[0])
+            target = self._parse_date_arg(args[0], allow_future=True)
             if target is None:
                 await update.message.reply_text(
-                    "日期格式不对，示例：/add 08-22 或 /add 2026-08-22（可以只给日期，也可以带上内容）",
+                    "日期格式不对，示例：/add 明天 内容、/add 09-07 内容 或 /add 2026-09-07\n"
+                    "（过去 60 天内或未来 30 天内；可以只给日期，也可以带上内容）",
                     reply_markup=MAIN_KEYBOARD,
                 )
                 return
