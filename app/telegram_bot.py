@@ -52,6 +52,7 @@ HELP_TEXT = """欢迎使用每日记录助手。
 /start - 显示欢迎信息
 /goals - 设定/查看本周目标（周报会逐条评估完成情况）
 /add - 添加任务记录（可补记或提前计划：/add 明天 内容、/add 09-07 内容）
+/edit - 修改某天已保存的任务（/edit、/edit 昨天、/edit 09-06）
 /today - 查看今天已记录的任务
 /review - 手动开始当天回顾（可指定日期：/review 07-29）
 /reflection - 手动开始今天反思
@@ -123,6 +124,7 @@ class TelegramDailyAssistantBot:
         application.add_handler(CommandHandler("start", self.start_command))
         application.add_handler(CommandHandler("help", self.help_command))
         application.add_handler(CommandHandler("add", self.add_command))
+        application.add_handler(CommandHandler("edit", self.edit_command))
         application.add_handler(CommandHandler("today", self.today_command))
         application.add_handler(CommandHandler("review", self.review_command))
         application.add_handler(CommandHandler("reflection", self.reflection_command))
@@ -146,6 +148,7 @@ class TelegramDailyAssistantBot:
         await self.application.bot.set_my_commands([
             BotCommand("goals", "设定/查看本周目标"),
             BotCommand("add", "补记或提前计划（/add 明天 内容）"),
+            BotCommand("edit", "修改某天的任务（/edit 09-06）"),
             BotCommand("today", "查看今天的任务"),
             BotCommand("review", "回顾（可加日期：/review 08-22）"),
             BotCommand("reflection", "写今天的反思"),
@@ -310,6 +313,49 @@ class TelegramDailyAssistantBot:
         self.state_manager.set_state(self.settings.telegram_user_id, "adding_task")
         await update.message.reply_text(
             "把今天早上要记录的内容发给我吧。可以是文字，也可以是一段语音。",
+            reply_markup=MAIN_KEYBOARD,
+        )
+
+    _STATUS_MARKS = {"Completed": "✅", "Partially Completed": "🔶", "Not Completed": "❌"}
+
+    async def edit_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._is_authorized(update):
+            return
+        args = context.args or []
+        if args:
+            target = self._parse_date_arg(args[0], allow_future=True)
+            if target is None:
+                await update.message.reply_text(
+                    "日期格式不对，示例：/edit（今天）、/edit 昨天、/edit 09-06",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+                return
+        else:
+            target = self.daily_record_service.today()
+        self._pending = None
+        try:
+            tasks = await self.daily_record_service.tasks_for(target)
+        except DailyRecordServiceError as exc:
+            await update.message.reply_text(f"读取任务失败：{exc}", reply_markup=MAIN_KEYBOARD)
+            return
+        label = self._date_label(target)
+        if not tasks:
+            self.state_manager.set_state(self.settings.telegram_user_id, "idle")
+            await update.message.reply_text(
+                f"{label}（{target[5:]}）还没有任务，可以用 /add {target[5:]} 直接添加。",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+        lines = [
+            f"{index}. {self._STATUS_MARKS.get(task.get('status'), '▫️')} {task.get('title', '')}"
+            f" ({task.get('category', 'W2')})"
+            for index, task in enumerate(tasks, start=1)
+        ]
+        self.state_manager.set_state(self.settings.telegram_user_id, f"editing@{target}")
+        await update.message.reply_text(
+            f"✏️ 修改{label}（{target[5:]}）的任务：\n\n" + "\n".join(lines) +
+            "\n\n直接回复修改意见（文字或语音），例如：\n"
+            "- 把第2个改成游泳一小时\n- 删除第3个\n- 第1个已完成\n- 再加一个：给客户回电话",
             reply_markup=MAIN_KEYBOARD,
         )
 
@@ -618,6 +664,12 @@ class TelegramDailyAssistantBot:
             return
 
         state_name, state_date = self._parse_state(state)
+        if state_name == "editing" and state_date:
+            await self._prepare_pending(
+                update, kind="edit", user_input=user_input, source=source, record_date=state_date
+            )
+            return
+
         if state_name == "adding_task" and state_date:
             await self._prepare_pending(
                 update, kind="task", user_input=user_input, source=source, record_date=state_date
@@ -663,6 +715,10 @@ class TelegramDailyAssistantBot:
                 parsed = await self.daily_record_service.parse_review(user_input, record_date)
             elif kind == "goals":
                 parsed = await self.daily_record_service.parse_goals(user_input)
+            elif kind == "edit":
+                parsed = await self.daily_record_service.parse_task_edits(
+                    record_date or self.daily_record_service.today(), user_input
+                )
             else:
                 parsed = await self.daily_record_service.parse_reflection(user_input, record_date)
         except DailyRecordServiceError as exc:
@@ -711,6 +767,21 @@ class TelegramDailyAssistantBot:
 
     @staticmethod
     def _format_preview(kind: str, parsed: dict, date_line: str = "") -> str:
+        if kind == "edit":
+            marks = {"Completed": "✅", "Partially Completed": "🔶", "Not Completed": "❌"}
+            tasks = parsed.get("tasks", [])
+            lines = [
+                f"{index}. {marks.get(task.get('status'), '▫️')} {task.get('title', '')}"
+                f" ({task.get('category', 'W2')})"
+                for index, task in enumerate(tasks, start=1)
+            ]
+            body = "\n".join(lines) if lines else "（清单将为空 — 如果要清空整天请用“重写”）"
+            return (
+                f"✏️ 修改后的任务清单：\n{date_line}\n"
+                f"{body}\n\n"
+                "确认保存吗？如果还有要改的，直接继续回复即可。"
+            )
+
         if kind == "goals":
             goals = parsed.get("goals", [])
             lines = [f"{index}. {goal}" for index, goal in enumerate(goals, start=1)]
@@ -797,8 +868,9 @@ class TelegramDailyAssistantBot:
                 "review": "awaiting_review",
                 "reflection": "awaiting_reflection",
                 "goals": "setting_goals",
+                "edit": "editing",
             }.get(kind, "idle")
-            if restore in {"awaiting_review", "awaiting_reflection"} and pending_date:
+            if restore in {"awaiting_review", "awaiting_reflection", "editing"} and pending_date:
                 restore = f"{restore}@{pending_date}"
             self.state_manager.set_state(self.settings.telegram_user_id, restore)
             await query.edit_message_text("已取消，这条记录没有写入 Notion。可以重新发送内容。")
@@ -838,6 +910,15 @@ class TelegramDailyAssistantBot:
                         + "\n".join(task_lines)
                         + f"\n\n你{saved_label}一共记录了 {result['task_count']} 个任务。"
                     )
+            elif kind == "edit":
+                result = await self.daily_record_service.commit_tasks(
+                    pending["parsed"], pending["raw"], pending["source"],
+                    record_date=pending.get("record_date"), replace=True,
+                )
+                self._pending = None
+                self.state_manager.set_state(self.settings.telegram_user_id, "idle")
+                edit_label = self._date_label(result.get("record_date") or self.daily_record_service.today())
+                message = f"✏️ 已更新{edit_label}的任务，现在共 {result['task_count']} 项。"
             elif kind == "goals":
                 goals = self.daily_record_service.commit_goals(pending["parsed"].get("goals", []))
                 self._pending = None

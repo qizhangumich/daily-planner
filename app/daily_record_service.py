@@ -105,6 +105,30 @@ class DailyRecordService:
         self.storage.save_weekly_goals(self.current_week_start(), cleaned)
         return cleaned
 
+    async def tasks_for(self, record_date: str) -> list[dict[str, Any]]:
+        payload, _ = await self._load_or_create_payload(record_date)
+        return payload.get("tasks", [])
+
+    async def parse_task_edits(self, record_date: str, instruction: str) -> dict[str, Any]:
+        if self.openai_client is None or self.prompts_dir is None:
+            raise DailyRecordServiceError("Edit support is not configured.")
+        tasks = [
+            {key: task.get(key) for key in ("title", "category", "status", "estimated_time_minutes", "notes")}
+            for task in await self.tasks_for(record_date)
+        ]
+        template = (self.prompts_dir / "edit_tasks.md").read_text(encoding="utf-8")
+        prompt = template.replace(
+            "{{tasks_json}}", json.dumps(tasks, ensure_ascii=False, indent=2)
+        ).replace("{{user_input}}", instruction)
+        glossary = self.glossary_text()
+        if glossary:
+            prompt += f"\n\n已知专有名词表（输出时必须严格使用以下拼写）：\n{glossary}"
+        try:
+            return await self.openai_client.generate_json(prompt)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Task edit parsing failed")
+            raise DailyRecordServiceError(f"Failed to parse task edits: {exc}") from exc
+
     async def add_task_to_today(self, user_input: str, source: str) -> dict[str, Any]:
         parsed = await self.parse_tasks(user_input)
         return await self.commit_tasks(parsed, user_input, source)
@@ -148,7 +172,8 @@ class DailyRecordService:
                     "id": f"task_{existing_count + index:03d}",
                     "title": task.get("title", "Untitled Task"),
                     "category": task.get("category", "W2"),
-                    "status": "Planned",
+                    "status": task.get("status") if task.get("status") in
+                    {"Planned", "Completed", "Partially Completed", "Not Completed", "Unknown"} else "Planned",
                     "estimated_time_minutes": task.get("estimated_time_minutes", 0),
                     "created_at": self.now_iso(),
                     "source": source,
