@@ -355,8 +355,41 @@ class TelegramDailyAssistantBot:
             await update.message.reply_text(str(exc), reply_markup=MAIN_KEYBOARD)
             return
         self._rituals_page_id = page_id
+        self.state_manager.set_state(self.settings.telegram_user_id, "rituals")
+        text, keyboard = self._rituals_view(checks)
+        await update.message.reply_text(
+            text + "\n\n也可以直接回复：“全部完成”，或“日记和锻炼完成了”。",
+            reply_markup=keyboard,
+        )
+
+    _ALL_DONE_PHRASES = ("全部完成", "全完成", "都完成", "全做完", "all done")
+
+    async def _handle_rituals_text(self, update: Update, user_input: str) -> bool:
+        """Text follow-up to /rituals: '全部完成' or naming rituals checks them.
+        Returns False when the text isn't about rituals."""
+        from app.rituals import RitualsError
+
+        if self.rituals_service is None or self._rituals_page_id is None:
+            return False
+        compact = user_input.replace(" ", "").lower()
+        all_done = any(phrase in compact for phrase in self._ALL_DONE_PHRASES)
+        matched = [] if all_done else self.rituals_service.match_rituals(user_input)
+        if not all_done and not matched:
+            return False
+        try:
+            if all_done:
+                names = list(self.rituals_service.rituals)
+            else:
+                names = matched
+            checks = await self.rituals_service.set_many(self._rituals_page_id, names, True)
+        except RitualsError as exc:
+            await update.message.reply_text(str(exc), reply_markup=MAIN_KEYBOARD)
+            return True
+        if all(checks.values()):
+            self.state_manager.set_state(self.settings.telegram_user_id, "idle")
         text, keyboard = self._rituals_view(checks)
         await update.message.reply_text(text, reply_markup=keyboard)
+        return True
 
     async def rituals_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -730,6 +763,14 @@ class TelegramDailyAssistantBot:
             return
 
         state_name, state_date = self._parse_state(state)
+        if state_name == "rituals":
+            handled = await self._handle_rituals_text(update, user_input)
+            if handled:
+                return
+            # Not ritual talk — fall back to normal recording.
+            self.state_manager.set_state(self.settings.telegram_user_id, "idle")
+            state_name, state_date = "idle", None
+
         if state_name == "editing" and state_date:
             await self._prepare_pending(
                 update, kind="edit", user_input=user_input, source=source, record_date=state_date

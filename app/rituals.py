@@ -121,6 +121,34 @@ class RitualsService:
             for name in self._ritual_props
         }
 
+    async def set_many(self, page_id: str, names: list[str], value: bool = True) -> dict[str, bool]:
+        """Set the given rituals to value and keep the aggregate in sync."""
+        await self.ensure_schema()
+        try:
+            page = await self.client.pages.retrieve(page_id=page_id)
+            checks = self._checks_from(page)
+            updates: dict[str, Any] = {}
+            for name in names:
+                if name in checks and checks[name] != value:
+                    checks[name] = value
+                    updates[name] = {"checkbox": value}
+            if self._aggregate_prop is not None:
+                updates[self._aggregate_prop] = {"checkbox": all(checks.values())}
+            if updates:
+                await self.client.pages.update(page_id=page_id, properties=updates)
+            return checks
+        except Exception as exc:  # noqa: BLE001
+            raise RitualsError(f"更新打卡失败：{exc}") from exc
+
+    def match_rituals(self, text: str) -> list[str]:
+        """Rituals whose (emoji-stripped) name appears in the text."""
+        matches = []
+        for name in self._ritual_props:
+            core = "".join(ch for ch in name if ch.isalnum() or "一" <= ch <= "鿿").strip()
+            if core and core.lower() in text.lower().replace(" ", ""):
+                matches.append(name)
+        return matches
+
     async def toggle(self, page_id: str, ritual: str) -> dict[str, bool]:
         """Flip one ritual and keep the aggregate in sync; returns fresh states."""
         await self.ensure_schema()
