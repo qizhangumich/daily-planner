@@ -59,6 +59,9 @@ def main() -> None:
     )
 
     state_manager = StateManager(storage)
+    from app.rituals import RitualsService
+
+    rituals_service = RitualsService(settings)
     bot = TelegramDailyAssistantBot(
         settings=settings,
         daily_record_service=daily_record_service,
@@ -66,6 +69,7 @@ def main() -> None:
         state_manager=state_manager,
         storage=storage,
         weekly_report_service=weekly_report_service,
+        rituals_service=rituals_service,
     )
 
     async def post_init(app) -> None:

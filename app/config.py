@@ -19,6 +19,7 @@ class Settings:
     telegram_user_id: int
     notion_token: str
     notion_daily_database_id: str
+    notion_rituals_database_id: Optional[str]
     openai_api_key: str
     timezone: str
     daily_review_hour: int
@@ -54,6 +55,7 @@ class Settings:
             telegram_user_id=int(require("TELEGRAM_USER_ID")),
             notion_token=require("NOTION_TOKEN"),
             notion_daily_database_id=require("NOTION_DAILY_DATABASE_ID"),
+            notion_rituals_database_id=os.getenv("NOTION_RITUALS_DATABASE_ID", "").strip() or None,
             openai_api_key=require("OPENAI_API_KEY"),
             timezone=os.getenv("TIMEZONE", "Asia/Singapore"),
             daily_review_hour=int(os.getenv("DAILY_REVIEW_HOUR", "21")),

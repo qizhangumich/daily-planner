@@ -15,6 +15,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -53,6 +54,7 @@ HELP_TEXT = """欢迎使用每日记录助手。
 /goals - 设定/查看本周目标（周报会逐条评估完成情况）
 /add - 添加任务记录（可补记或提前计划：/add 明天 内容、/add 09-07 内容）
 /edit - 修改某天已保存的任务（/edit、/edit 昨天、/edit 09-06）
+/rituals - 今日五项打卡（点按打勾，自动同步 Notion）
 /today - 查看今天已记录的任务
 /review - 手动开始当天回顾（可指定日期：/review 07-29）
 /reflection - 手动开始今天反思
@@ -103,6 +105,7 @@ class TelegramDailyAssistantBot:
         state_manager: StateManager,
         storage: Storage,
         weekly_report_service: WeeklyReportService,
+        rituals_service=None,
     ) -> None:
         self.settings = settings
         self.daily_record_service = daily_record_service
@@ -110,8 +113,10 @@ class TelegramDailyAssistantBot:
         self.state_manager = state_manager
         self.storage = storage
         self.weekly_report_service = weekly_report_service
+        self.rituals_service = rituals_service
         self.application: Application | None = None
         self._pending: dict | None = None
+        self._rituals_page_id: str | None = None
 
     def build_application(self, post_init=None, post_shutdown=None) -> Application:
         builder = ApplicationBuilder().token(self.settings.telegram_bot_token)
@@ -125,6 +130,8 @@ class TelegramDailyAssistantBot:
         application.add_handler(CommandHandler("help", self.help_command))
         application.add_handler(CommandHandler("add", self.add_command))
         application.add_handler(CommandHandler("edit", self.edit_command))
+        application.add_handler(CommandHandler("rituals", self.rituals_command))
+        application.add_handler(CallbackQueryHandler(self.rituals_callback, pattern=r"^rit:"))
         application.add_handler(CommandHandler("today", self.today_command))
         application.add_handler(CommandHandler("review", self.review_command))
         application.add_handler(CommandHandler("reflection", self.reflection_command))
@@ -149,6 +156,7 @@ class TelegramDailyAssistantBot:
             BotCommand("goals", "设定/查看本周目标"),
             BotCommand("add", "补记或提前计划（/add 明天 内容）"),
             BotCommand("edit", "修改某天的任务（/edit 09-06）"),
+            BotCommand("rituals", "今日五项打卡"),
             BotCommand("today", "查看今天的任务"),
             BotCommand("review", "回顾（可加日期：/review 08-22）"),
             BotCommand("reflection", "写今天的反思"),
@@ -317,6 +325,64 @@ class TelegramDailyAssistantBot:
         )
 
     _STATUS_MARKS = {"Completed": "✅", "Partially Completed": "🔶", "Not Completed": "❌"}
+
+    def _rituals_view(self, checks: dict) -> tuple[str, InlineKeyboardMarkup]:
+        done = sum(1 for value in checks.values() if value)
+        text = f"📍 今日打卡（{done}/{len(checks)}）— 点按切换："
+        if checks and done == len(checks):
+            text += "\n🎉 全部完成！Daily 5 已自动打勾。"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"{'✅' if value else '⬜'} {name}", callback_data=f"rit:{index}"
+            )]
+            for index, (name, value) in enumerate(checks.items())
+        ])
+        return text, keyboard
+
+    async def rituals_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._is_authorized(update):
+            return
+        from app.rituals import RitualsError
+
+        if self.rituals_service is None or not self.rituals_service.configured:
+            await update.message.reply_text(
+                "打卡功能还没有配置（缺少 NOTION_RITUALS_DATABASE_ID）。", reply_markup=MAIN_KEYBOARD
+            )
+            return
+        try:
+            page_id, checks = await self.rituals_service.today_row()
+        except RitualsError as exc:
+            await update.message.reply_text(str(exc), reply_markup=MAIN_KEYBOARD)
+            return
+        self._rituals_page_id = page_id
+        text, keyboard = self._rituals_view(checks)
+        await update.message.reply_text(text, reply_markup=keyboard)
+
+    async def rituals_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if query is None or query.from_user is None or query.from_user.id != self.settings.telegram_user_id:
+            return
+        await query.answer()
+        from app.rituals import RitualsError
+
+        if self.rituals_service is None or self._rituals_page_id is None:
+            await query.edit_message_text("这个打卡面板已过期，请重新发送 /rituals。")
+            return
+        try:
+            index = int(query.data.split(":", 1)[1])
+            rituals = self.rituals_service.rituals
+            if index >= len(rituals):
+                raise RitualsError("打卡项已变化，请重新发送 /rituals。")
+            checks = await self.rituals_service.toggle(self._rituals_page_id, rituals[index])
+        except RitualsError as exc:
+            await query.edit_message_text(str(exc))
+            return
+        text, keyboard = self._rituals_view(checks)
+        try:
+            await query.edit_message_text(text, reply_markup=keyboard)
+        except BadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                raise
 
     async def edit_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
