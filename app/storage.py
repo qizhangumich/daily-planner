@@ -49,6 +49,16 @@ class Storage:
                     goals_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS network_contacts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    company TEXT DEFAULT '',
+                    role TEXT DEFAULT '',
+                    context TEXT DEFAULT '',
+                    met_date TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -136,6 +146,31 @@ class Storage:
                 (week_start,),
             ).fetchone()
         return json.loads(row["goals_json"]) if row else []
+
+    def add_contact(self, name: str, company: str, role: str, context: str, met_date: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO network_contacts (name, company, role, context, met_date, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (name, company, role, context, met_date, self._now()),
+            )
+
+    def contacts_between(self, start_date: str, end_date: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT name, company, role, context, met_date FROM network_contacts
+                WHERE met_date BETWEEN ? AND ? ORDER BY met_date, id
+                """,
+                (start_date, end_date),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def contacts_count(self) -> int:
+        with self._lock:
+            return self._connection.execute("SELECT count(*) FROM network_contacts").fetchone()[0]
 
     def add_glossary_term(self, term: str) -> None:
         with self._lock, self._connection:

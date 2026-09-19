@@ -105,6 +105,38 @@ class DailyRecordService:
         self.storage.save_weekly_goals(self.current_week_start(), cleaned)
         return cleaned
 
+    async def parse_contacts(self, user_input: str) -> dict[str, Any]:
+        if self.openai_client is None or self.prompts_dir is None:
+            raise DailyRecordServiceError("Network support is not configured.")
+        template = (self.prompts_dir / "parse_contact.md").read_text(encoding="utf-8")
+        prompt = template.replace("{{user_input}}", user_input)
+        glossary = self.glossary_text()
+        if glossary:
+            prompt += f"\n\n已知专有名词表（输出时必须严格使用以下拼写）：\n{glossary}"
+        try:
+            return await self.openai_client.generate_json(prompt)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Contact parsing failed")
+            raise DailyRecordServiceError(f"Failed to parse contacts: {exc}") from exc
+
+    def commit_contacts(self, contacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        saved = []
+        for contact in contacts:
+            name = str(contact.get("name", "")).strip()
+            if not name:
+                continue
+            self.storage.add_contact(
+                name=name,
+                company=str(contact.get("company", "")).strip(),
+                role=str(contact.get("role", "")).strip(),
+                context=str(contact.get("context", "")).strip(),
+                met_date=self.today(),
+            )
+            # Names join the glossary so voice transcription spells them right.
+            self.storage.add_glossary_term(name)
+            saved.append(contact)
+        return saved
+
     async def tasks_for(self, record_date: str) -> list[dict[str, Any]]:
         payload, _ = await self._load_or_create_payload(record_date)
         return payload.get("tasks", [])

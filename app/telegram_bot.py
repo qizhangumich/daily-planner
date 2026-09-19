@@ -55,6 +55,7 @@ HELP_TEXT = """欢迎使用每日记录助手。
 /add - 添加任务记录（可补记或提前计划：/add 明天 内容、/add 09-07 内容）
 /edit - 修改某天已保存的任务（/edit、/edit 昨天、/edit 09-06）
 /rituals - 今日五项打卡（点按打勾，自动同步 Notion）
+/network - 记录新认识的人（周报自动汇总本周人脉）
 /today - 查看今天已记录的任务
 /review - 手动开始当天回顾（可指定日期：/review 07-29）
 /reflection - 手动开始今天反思
@@ -131,6 +132,7 @@ class TelegramDailyAssistantBot:
         application.add_handler(CommandHandler("add", self.add_command))
         application.add_handler(CommandHandler("edit", self.edit_command))
         application.add_handler(CommandHandler("rituals", self.rituals_command))
+        application.add_handler(CommandHandler("network", self.network_command))
         application.add_handler(CallbackQueryHandler(self.rituals_callback, pattern=r"^rit:"))
         application.add_handler(CommandHandler("today", self.today_command))
         application.add_handler(CommandHandler("review", self.review_command))
@@ -157,6 +159,7 @@ class TelegramDailyAssistantBot:
             BotCommand("add", "补记或提前计划（/add 明天 内容）"),
             BotCommand("edit", "修改某天的任务（/edit 09-06）"),
             BotCommand("rituals", "今日五项打卡"),
+            BotCommand("network", "记录新认识的人"),
             BotCommand("today", "查看今天的任务"),
             BotCommand("review", "回顾（可加日期：/review 08-22）"),
             BotCommand("reflection", "写今天的反思"),
@@ -499,6 +502,39 @@ class TelegramDailyAssistantBot:
             return
         await self._send_review_prompt(chat_id=update.effective_chat.id, allow_picker=True)
 
+    async def network_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._is_authorized(update):
+            return
+        self._pending = None
+        args = context.args or []
+        if args:
+            await self._prepare_pending(
+                update, kind="contact", user_input=" ".join(args), source="Telegram Text"
+            )
+            return
+        week_start = self.daily_record_service.current_week_start()
+        week_end = (date.fromisoformat(week_start) + timedelta(days=6)).isoformat()
+        this_week = self.storage.contacts_between(week_start, week_end)
+        total = self.storage.contacts_count()
+        if this_week:
+            lines = [
+                f"{index}. {c['name']}"
+                + (f"（{c['company']}" + (f" · {c['role']}" if c['role'] else "") + "）" if c['company'] or c['role'] else "")
+                + (f" — {c['context']}" if c['context'] else "")
+                for index, c in enumerate(this_week, start=1)
+            ]
+            listing = "\n".join(lines)
+        else:
+            listing = "（本周还没有新增人脉）"
+        self.state_manager.set_state(self.settings.telegram_user_id, "adding_contact")
+        await update.message.reply_text(
+            f"🤝 本周新增人脉（累计 {total} 人）：\n\n{listing}\n\n"
+            "直接回复新认识的人（文字或语音），例如：\n"
+            "“今天认识了迪拜律所的 Ahmed，合伙人，聊了海水淡化合作”\n"
+            "周报会自动汇总本周的新增人脉。",
+            reply_markup=MAIN_KEYBOARD,
+        )
+
     async def goals_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
             return
@@ -763,6 +799,10 @@ class TelegramDailyAssistantBot:
             return
 
         state_name, state_date = self._parse_state(state)
+        if state_name == "adding_contact":
+            await self._prepare_pending(update, kind="contact", user_input=user_input, source=source)
+            return
+
         if state_name == "rituals":
             handled = await self._handle_rituals_text(update, user_input)
             if handled:
@@ -826,6 +866,8 @@ class TelegramDailyAssistantBot:
                 parsed = await self.daily_record_service.parse_task_edits(
                     record_date or self.daily_record_service.today(), user_input
                 )
+            elif kind == "contact":
+                parsed = await self.daily_record_service.parse_contacts(user_input)
             else:
                 parsed = await self.daily_record_service.parse_reflection(user_input, record_date)
         except DailyRecordServiceError as exc:
@@ -874,6 +916,22 @@ class TelegramDailyAssistantBot:
 
     @staticmethod
     def _format_preview(kind: str, parsed: dict, date_line: str = "") -> str:
+        if kind == "contact":
+            contacts = parsed.get("contacts", [])
+            lines = [
+                f"{index}. {c.get('name', '')}"
+                + (f"（{c.get('company', '')}" + (f" · {c.get('role', '')}" if c.get("role") else "") + "）"
+                   if c.get("company") or c.get("role") else "")
+                + (f"\n   {c.get('context', '')}" if c.get("context") else "")
+                for index, c in enumerate(contacts, start=1)
+            ]
+            body = "\n".join(lines) if lines else "（没有解析出人物）"
+            return (
+                "🤝 以下人脉将保存：\n\n"
+                f"{body}\n\n"
+                "确认保存吗？如果名字写错了，直接回复修改意见即可。"
+            )
+
         if kind == "edit":
             marks = {"Completed": "✅", "Partially Completed": "🔶", "Not Completed": "❌"}
             tasks = parsed.get("tasks", [])
@@ -976,6 +1034,7 @@ class TelegramDailyAssistantBot:
                 "reflection": "awaiting_reflection",
                 "goals": "setting_goals",
                 "edit": "editing",
+                "contact": "adding_contact",
             }.get(kind, "idle")
             if restore in {"awaiting_review", "awaiting_reflection", "editing"} and pending_date:
                 restore = f"{restore}@{pending_date}"
@@ -1026,6 +1085,15 @@ class TelegramDailyAssistantBot:
                 self.state_manager.set_state(self.settings.telegram_user_id, "idle")
                 edit_label = self._date_label(result.get("record_date") or self.daily_record_service.today())
                 message = f"✏️ 已更新{edit_label}的任务，现在共 {result['task_count']} 项。"
+            elif kind == "contact":
+                saved = self.daily_record_service.commit_contacts(pending["parsed"].get("contacts", []))
+                self._pending = None
+                self.state_manager.set_state(self.settings.telegram_user_id, "idle")
+                names = "、".join(str(c.get("name", "")) for c in saved)
+                message = (
+                    f"🤝 已保存 {len(saved)} 位新人脉：{names}\n\n"
+                    "名字已加入专有名词表（语音不会写错），周报会汇总本周的新增人脉。"
+                )
             elif kind == "goals":
                 goals = self.daily_record_service.commit_goals(pending["parsed"].get("goals", []))
                 self._pending = None

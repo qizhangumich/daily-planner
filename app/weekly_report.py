@@ -85,10 +85,11 @@ class WeeklyReportService:
 
         days = await self._collect_week_data(week_start, week_end)
         week_goals = self.storage.get_weekly_goals(week_start.isoformat())
-        ai_summary = await self._generate_ai_summary(days, week_goals)
+        week_contacts = self.storage.contacts_between(week_start.isoformat(), week_end.isoformat())
+        ai_summary = await self._generate_ai_summary(days, week_goals, week_contacts)
 
         output_path = self.data_dir / f"weekly_report_{week_start.isoformat()}_{week_end.isoformat()}.pdf"
-        self._render_pdf(days, week_start, week_end, ai_summary, output_path, week_goals)
+        self._render_pdf(days, week_start, week_end, ai_summary, output_path, week_goals, week_contacts)
         return output_path, week_start, week_end
 
     async def _collect_week_data(self, week_start: date, week_end: date) -> list[DayData]:
@@ -156,11 +157,15 @@ class WeeklyReportService:
         day.fallback_text = text_of("Daily Summary")
         day.has_record = bool(day.tasks or day.fallback_text)
 
-    async def _generate_ai_summary(self, days: list[DayData], week_goals: list[str] | None = None) -> dict[str, Any]:
+    async def _generate_ai_summary(
+        self, days: list[DayData], week_goals: list[str] | None = None,
+        week_contacts: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         recorded = [day for day in days if day.has_record]
         if not recorded:
             return {}
         week_goals = week_goals or []
+        week_contacts = week_contacts or []
 
         lines: list[str] = []
         for day in recorded:
@@ -178,6 +183,17 @@ class WeeklyReportService:
                     lines.append(f"{label}: {day.reflection[key]}")
             if day.fallback_text:
                 lines.append(day.fallback_text[:600])
+            lines.append("")
+
+        if week_contacts:
+            lines.append("### 本周新增人脉")
+            for contact in week_contacts:
+                parts = [contact["name"]]
+                if contact.get("company"):
+                    parts.append(contact["company"])
+                if contact.get("context"):
+                    parts.append(contact["context"])
+                lines.append("- " + "，".join(parts))
             lines.append("")
 
         try:
@@ -201,10 +217,13 @@ class WeeklyReportService:
         ai_summary: dict[str, Any],
         output_path: Path,
         week_goals: list[str] | None = None,
+        week_contacts: list[dict[str, Any]] | None = None,
     ) -> None:
         from weasyprint import HTML  # imported lazily: heavy native deps
 
-        document = build_report_html(days, week_start, week_end, ai_summary, self.timezone, week_goals)
+        document = build_report_html(
+            days, week_start, week_end, ai_summary, self.timezone, week_goals, week_contacts
+        )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         HTML(string=document).write_pdf(str(output_path))
 
@@ -329,6 +348,28 @@ def render_goals_section(week_goals: list[str], ai_summary: dict[str, Any]) -> s
     </section>"""
 
 
+def render_contacts_section(week_contacts: list[dict[str, Any]]) -> str:
+    if not week_contacts:
+        return ""
+    rows = []
+    for contact in week_contacts:
+        meta = " · ".join(part for part in (contact.get("company", ""), contact.get("role", "")) if part)
+        meta_html = f'<span class="contact-meta">（{_esc(meta)}）</span>' if meta else ""
+        context_html = (
+            f'<div class="contact-context">{_esc(contact.get("context", ""))}</div>'
+            if contact.get("context") else ""
+        )
+        rows.append(
+            f'<div class="contact-row"><div><b>{_esc(contact.get("name", ""))}</b>{meta_html}'
+            f"{context_html}</div></div>"
+        )
+    return f"""
+    <section class="contacts">
+      <h3>🤝 本周新增人脉（{len(week_contacts)} 人）</h3>
+      {''.join(rows)}
+    </section>"""
+
+
 def build_report_html(
     days: list[DayData],
     week_start: date,
@@ -336,6 +377,7 @@ def build_report_html(
     ai_summary: dict[str, Any],
     timezone: ZoneInfo,
     week_goals: list[str] | None = None,
+    week_contacts: list[dict[str, Any]] | None = None,
 ) -> str:
     recorded_days = [day for day in days if day.has_record]
     scores = [day.completion_score for day in recorded_days if day.completion_score is not None]
@@ -428,6 +470,14 @@ def build_report_html(
   .goal-status {{ flex: none; font-size: 9pt; font-weight: 700; width: 22mm; }}
   .goal-title {{ font-size: 10pt; color: #111827; }}
   .goal-evidence {{ font-size: 8.5pt; color: #6b7280; margin-top: 0.5mm; }}
+  .contacts {{
+    background: #f0fdf4; border: 1px solid #dcfce7;
+    border-radius: 10px; padding: 5mm 6mm; margin-bottom: 7mm;
+  }}
+  .contacts h3 {{ font-size: 10.5pt; color: #166534; margin-bottom: 2.5mm; }}
+  .contact-row {{ padding: 1.2mm 0; font-size: 10pt; }}
+  .contact-meta {{ color: #6b7280; font-size: 9pt; }}
+  .contact-context {{ color: #4b5563; font-size: 9pt; margin-top: 0.5mm; }}
   .summary {{
     background: #fafaff; border-left: 3px solid #4f46e5;
     border-radius: 0 10px 10px 0; padding: 5mm 6mm; margin-bottom: 8mm;
@@ -490,6 +540,7 @@ def build_report_html(
   <div class="content">
     <div class="stats">{stats_html}</div>
     {render_goals_section(week_goals or [], ai_summary)}
+    {render_contacts_section(week_contacts or [])}
     {summary_html}
     {days_html}
   </div>
