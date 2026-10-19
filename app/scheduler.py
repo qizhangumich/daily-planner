@@ -11,7 +11,7 @@ class DailyScheduler:
         self.scheduler = AsyncIOScheduler(timezone=settings.timezone)
         self.settings = settings
 
-    def start(self, reminder_callback) -> None:
+    def start(self, reminder_callback, rituals_callback=None) -> None:
         self.scheduler.add_job(
             reminder_callback,
             CronTrigger(
@@ -22,6 +22,17 @@ class DailyScheduler:
             id="evening_review_reminder",
             replace_existing=True,
         )
+        if rituals_callback is not None:
+            self.scheduler.add_job(
+                rituals_callback,
+                CronTrigger(
+                    hour=self.settings.rituals_reminder_hour,
+                    minute=self.settings.rituals_reminder_minute,
+                    timezone=self.settings.timezone,
+                ),
+                id="rituals_reminder",
+                replace_existing=True,
+            )
         self.scheduler.start()
 
     def shutdown(self) -> None:

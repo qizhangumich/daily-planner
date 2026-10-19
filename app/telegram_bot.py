@@ -134,6 +134,7 @@ class TelegramDailyAssistantBot:
         application.add_handler(CommandHandler("rituals", self.rituals_command))
         application.add_handler(CommandHandler("network", self.network_command))
         application.add_handler(CallbackQueryHandler(self.rituals_callback, pattern=r"^rit:"))
+        application.add_handler(CallbackQueryHandler(self.rituals_network_callback, pattern=r"^ritnet$"))
         application.add_handler(CommandHandler("today", self.today_command))
         application.add_handler(CommandHandler("review", self.review_command))
         application.add_handler(CommandHandler("reflection", self.reflection_command))
@@ -329,18 +330,26 @@ class TelegramDailyAssistantBot:
 
     _STATUS_MARKS = {"Completed": "✅", "Partially Completed": "🔶", "Not Completed": "❌"}
 
-    def _rituals_view(self, checks: dict) -> tuple[str, InlineKeyboardMarkup]:
+    def _rituals_view(self, checks: dict, network_text: str = "") -> tuple[str, InlineKeyboardMarkup]:
         done = sum(1 for value in checks.values() if value)
-        text = f"📍 今日打卡（{done}/{len(checks)}）— 点按切换："
-        if checks and done == len(checks):
-            text += "\n🎉 全部完成！Daily 5 已自动打勾。"
-        keyboard = InlineKeyboardMarkup([
+        network_ok = bool(network_text)
+        total = len(checks) + 1
+        text = f"📍 今日打卡（{done + (1 if network_ok else 0)}/{total}）— 点按切换："
+        if network_ok:
+            text += f"\n🤝 人脉：{network_text[:120]}"
+        if checks and done == len(checks) and network_ok:
+            text += "\n🎉 全部完成！"
+        rows = [
             [InlineKeyboardButton(
                 f"{'✅' if value else '⬜'} {name}", callback_data=f"rit:{index}"
             )]
             for index, (name, value) in enumerate(checks.items())
-        ])
-        return text, keyboard
+        ]
+        rows.append([InlineKeyboardButton(
+            f"{'✅' if network_ok else '✍️'} 人脉（{'已填，点按补充' if network_ok else '未填，点按输入'}）",
+            callback_data="ritnet",
+        )])
+        return text, InlineKeyboardMarkup(rows)
 
     async def rituals_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
@@ -353,19 +362,47 @@ class TelegramDailyAssistantBot:
             )
             return
         try:
-            page_id, checks = await self.rituals_service.today_row()
+            page_id, checks, network_text = await self.rituals_service.today_row()
         except RitualsError as exc:
             await update.message.reply_text(str(exc), reply_markup=MAIN_KEYBOARD)
             return
         self._rituals_page_id = page_id
         self.state_manager.set_state(self.settings.telegram_user_id, "rituals")
-        text, keyboard = self._rituals_view(checks)
+        text, keyboard = self._rituals_view(checks, network_text)
         await update.message.reply_text(
             text + "\n\n也可以直接回复：“全部完成”，或“日记和锻炼完成了”。",
             reply_markup=keyboard,
         )
 
     _ALL_DONE_PHRASES = ("全部完成", "全完成", "都完成", "全做完", "all done")
+
+    async def _handle_rituals_network_input(self, update: Update, user_input: str) -> None:
+        from app.rituals import RitualsError
+
+        if self.rituals_service is None or self._rituals_page_id is None:
+            self.state_manager.set_state(self.settings.telegram_user_id, "idle")
+            await update.message.reply_text("打卡面板已过期，请重新发送 /rituals。", reply_markup=MAIN_KEYBOARD)
+            return
+        try:
+            checks, network_text = await self.rituals_service.set_network_text(
+                self._rituals_page_id, user_input
+            )
+        except RitualsError as exc:
+            await update.message.reply_text(str(exc), reply_markup=MAIN_KEYBOARD)
+            return
+        # Best effort: also feed structured contacts into the network log (and glossary).
+        contact_note = ""
+        try:
+            parsed = await self.daily_record_service.parse_contacts(user_input)
+            saved = self.daily_record_service.commit_contacts(parsed.get("contacts", []))
+            if saved:
+                names = "、".join(str(c.get("name", "")) for c in saved)
+                contact_note = f"\n已同时加入人脉库：{names}（周报会汇总）"
+        except DailyRecordServiceError:
+            pass
+        self.state_manager.set_state(self.settings.telegram_user_id, "rituals")
+        text, keyboard = self._rituals_view(checks, network_text)
+        await update.message.reply_text("🤝 人脉已记录。" + contact_note + "\n\n" + text, reply_markup=keyboard)
 
     async def _handle_rituals_text(self, update: Update, user_input: str) -> bool:
         """Text follow-up to /rituals: '全部完成' or naming rituals checks them.
@@ -384,13 +421,13 @@ class TelegramDailyAssistantBot:
                 names = list(self.rituals_service.rituals)
             else:
                 names = matched
-            checks = await self.rituals_service.set_many(self._rituals_page_id, names, True)
+            checks, network_text = await self.rituals_service.set_many(self._rituals_page_id, names, True)
         except RitualsError as exc:
             await update.message.reply_text(str(exc), reply_markup=MAIN_KEYBOARD)
             return True
-        if all(checks.values()):
+        if all(checks.values()) and network_text:
             self.state_manager.set_state(self.settings.telegram_user_id, "idle")
-        text, keyboard = self._rituals_view(checks)
+        text, keyboard = self._rituals_view(checks, network_text)
         await update.message.reply_text(text, reply_markup=keyboard)
         return True
 
@@ -409,16 +446,49 @@ class TelegramDailyAssistantBot:
             rituals = self.rituals_service.rituals
             if index >= len(rituals):
                 raise RitualsError("打卡项已变化，请重新发送 /rituals。")
-            checks = await self.rituals_service.toggle(self._rituals_page_id, rituals[index])
+            checks, network_text = await self.rituals_service.toggle(self._rituals_page_id, rituals[index])
         except RitualsError as exc:
             await query.edit_message_text(str(exc))
             return
-        text, keyboard = self._rituals_view(checks)
+        text, keyboard = self._rituals_view(checks, network_text)
         try:
             await query.edit_message_text(text, reply_markup=keyboard)
         except BadRequest as exc:
             if "not modified" not in str(exc).lower():
                 raise
+
+    async def rituals_network_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if query is None or query.from_user is None or query.from_user.id != self.settings.telegram_user_id:
+            return
+        await query.answer()
+        if self.rituals_service is None or self._rituals_page_id is None:
+            await query.edit_message_text("这个打卡面板已过期，请重新发送 /rituals。")
+            return
+        self.state_manager.set_state(self.settings.telegram_user_id, "rituals_network")
+        await query.message.reply_text(
+            "🤝 请回复今天的人脉记录（认识了谁、什么背景、聊了什么）。文字或语音都可以。",
+            reply_markup=MAIN_KEYBOARD,
+        )
+
+    async def send_rituals_reminder(self) -> None:
+        if self.application is None or self.rituals_service is None or not self.rituals_service.configured:
+            return
+        from app.rituals import RitualsError
+
+        try:
+            page_id, checks, network_text = await self.rituals_service.today_row()
+        except RitualsError as exc:
+            logger.warning("Rituals reminder failed: %s", exc)
+            return
+        self._rituals_page_id = page_id
+        self.state_manager.set_state(self.settings.telegram_user_id, "rituals")
+        text, keyboard = self._rituals_view(checks, network_text)
+        await self.application.bot.send_message(
+            chat_id=self.settings.telegram_user_id,
+            text="🌙 睡前打卡时间：\n\n" + text + "\n\n点按打勾，或回复“全部完成”；点“人脉”填写今天认识的人。",
+            reply_markup=keyboard,
+        )
 
     async def edit_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_authorized(update):
@@ -799,6 +869,10 @@ class TelegramDailyAssistantBot:
             return
 
         state_name, state_date = self._parse_state(state)
+        if state_name == "rituals_network":
+            await self._handle_rituals_network_input(update, user_input)
+            return
+
         if state_name == "adding_contact":
             await self._prepare_pending(update, kind="contact", user_input=user_input, source=source)
             return
